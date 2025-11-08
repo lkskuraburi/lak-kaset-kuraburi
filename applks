@@ -1,0 +1,2772 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app'; 
+import { 
+    getAuth, 
+    signInAnonymously, 
+    signInWithCustomToken, 
+    onAuthStateChanged,
+    signInWithEmailAndPassword, // NEW
+    createUserWithEmailAndPassword, // NEW
+    signOut // NEW
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    collection, 
+    query, 
+    onSnapshot, 
+    doc, 
+    addDoc, 
+    setDoc, 
+    updateDoc, 
+    deleteDoc,
+    serverTimestamp,
+    setLogLevel,
+    runTransaction,
+    getDocs 
+} from 'firebase/firestore';
+import { 
+    Trash2, Edit, Save, X, Plus, Sprout, AlertTriangle, Key, Settings, Package, DollarSign, List, Home, TrendingUp, Minus, AlertCircle, Zap, Printer, Eye, Truck, DownloadCloud, TrendingDown, Clock, User, LogOut, UserPlus
+} from 'lucide-react'; 
+
+// --- 1. Global Setup & Config ---
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+// FIX: Corrected typo in the initialAuthToken check
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null; // FIXED variable name
+
+setLogLevel('debug');
+
+const CONFIG_DOC_PATH = 'app_settings/admin_pin'; 
+const PIN_LENGTH = 4; // *** CRITICAL: PIN length is 4 ***
+const COLLECTION_PATHS = {
+    categories: 'custom_categories_agri',
+    products: 'products_agri',
+    sales: 'sales_agri',
+    goodsReceipts: 'goods_receipts_agri', 
+};
+
+const TAB_OPTIONS = {
+    DASHBOARD: 'dashboard',
+    CATEGORY: 'categories',
+    PRODUCT: 'products',
+    GOODS_RECEIPT: 'goods_receipts', 
+    SALE: 'sales',
+    ADMIN: 'admin',
+};
+
+// --- Helper Functions ---
+
+const formatCurrency = (amount) => {
+    return new Intl.NumberFormat('th-TH', { style: 'currency', currency: 'THB', minimumFractionDigits: 2 }).format(amount);
+};
+
+const LoadingSpinner = () => (
+    <div className="flex justify-center items-center h-full py-20">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-green-600"></div>
+        <span className="ml-3 text-green-600">กำลังโหลดข้อมูล...</span>
+    </div>
+);
+
+// --- 2. Shared Components: Delete Modal ---
+
+// Modal ยืนยันการลบ พร้อมช่องใส่ PIN
+const DeleteConfirmationModal = ({ isOpen, onClose, onConfirm, itemName, deleteAction, correctPin }) => {
+    const [pinInput, setPinInput] = useState('');
+    const [isPinValid, setIsPinValid] = useState(true);
+
+    if (!isOpen) return null;
+
+    const handleConfirm = () => {
+        if (pinInput === correctPin) {
+            setIsPinValid(true);
+            setPinInput('');
+            onConfirm();
+        } else {
+            setIsPinValid(false);
+        }
+    };
+
+    const handleClose = () => {
+        setPinInput('');
+        setIsPinValid(true);
+        onClose();
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-xl p-6 w-full max-w-sm shadow-2xl transform transition-all duration-300 scale-100">
+                <div className="flex flex-col items-center">
+                    <AlertTriangle size={48} className="text-red-500 mb-4" />
+                    <h3 className="text-xl font-bold text-gray-800 mb-2">ยืนยันรหัส PIN เพื่อ {deleteAction}</h3>
+                    <p className="text-center text-gray-600 mb-4">
+                        การ {deleteAction} **"{itemName}"** ต้องใช้รหัสยืนยัน Admin
+                    </p>
+
+                    <input
+                        type="password"
+                        placeholder={`กรอกรหัส PIN ${PIN_LENGTH} หลัก`}
+                        value={pinInput}
+                        onChange={(e) => setPinInput(e.target.value.replace(/[^0-9]/g, '').slice(0, PIN_LENGTH))}
+                        maxLength={PIN_LENGTH}
+                        className={`w-full p-3 mb-4 text-center border-2 rounded-lg font-mono text-lg ${
+                            isPinValid ? 'border-gray-300 focus:border-red-500' : 'border-red-500 ring-2 ring-red-100'
+                        }`}
+                        required
+                    />
+
+                    {!isPinValid && (
+                        <p className="text-red-500 text-sm mb-4 font-semibold">รหัส PIN ไม่ถูกต้อง โปรดลองอีกครั้ง!</p>
+                    )}
+
+                    <div className="flex justify-center space-x-4 w-full">
+                        <button
+                            onClick={handleClose}
+                            className="flex-1 px-4 py-2 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300 transition duration-150"
+                        >
+                            ยกเลิก
+                        </button>
+                        <button
+                            onClick={handleConfirm}
+                            className="flex-1 px-4 py-2 bg-red-500 text-white rounded-lg font-semibold hover:bg-red-600 transition duration-150 shadow-lg shadow-red-200"
+                            disabled={pinInput.length !== PIN_LENGTH}
+                        >
+                            ยืนยันและดำเนินการ
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- 3. Tab: Dashboard Manager ---
+
+const DashboardManager = ({ products, sales }) => {
+    const [selectedFilter, setSelectedFilter] = useState('all'); // 'all', 'year-YYYY', 'month-YYYY-MM'
+
+    // Calculate unique periods available for filtering
+    const availablePeriods = useMemo(() => {
+        const months = new Set();
+        const years = new Set();
+        sales.forEach(sale => {
+            if (sale.createdAt?.toDate) {
+                const date = sale.createdAt.toDate();
+                const year = date.getFullYear().toString();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                
+                months.add(`${year}-${month}`);
+                years.add(year);
+            }
+        });
+        
+        return {
+            months: Array.from(months).sort().reverse(),
+            years: Array.from(years).sort().reverse()
+        };
+    }, [sales]);
+
+    // Filter sales based on selected period
+    const filteredSales = useMemo(() => {
+        if (selectedFilter === 'all') {
+            return sales;
+        }
+
+        const parts = selectedFilter.split('-');
+        const filterType = parts[0]; // 'year' or 'month'
+        const filterValue = parts.slice(1).join('-'); // 'YYYY' or 'YYYY-MM'
+
+        return sales.filter(sale => {
+            if (!sale.createdAt?.toDate) return false;
+            const date = sale.createdAt.toDate();
+            const year = date.getFullYear().toString();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const yearMonth = `${year}-${month}`;
+
+            if (filterType === 'year' && year === filterValue) return true;
+            if (filterType === 'month' && yearMonth === filterValue) return true;
+            
+            return false;
+        });
+    }, [sales, selectedFilter]);
+
+
+    // Recalculate summary using filteredSales
+    const summary = useMemo(() => {
+        let totalRevenue = 0;
+        let totalCostOfGoodsSold = 0;
+
+        filteredSales.forEach(sale => {
+            totalRevenue += sale.totalRevenue || 0;
+            totalCostOfGoodsSold += sale.totalCostOfGoodsSold || 0;
+        });
+
+        const totalProfit = totalRevenue - totalCostOfGoodsSold;
+        const profitMargin = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
+        
+        // Stock counts MUST be based on ALL products, not filtered sales
+        const totalProducts = products.length;
+        const lowStockCount = products.filter(p => 
+            p.stockQuantity > 0 && p.stockQuantity <= (p.minStockThreshold || 0)
+        ).length;
+        
+        const outOfStockCount = products.filter(p => (p.stockQuantity || 0) <= 0).length;
+
+        return {
+            totalRevenue,
+            totalCostOfGoodsSold,
+            totalProfit,
+            profitMargin,
+            totalProducts: products.length,
+            totalSalesCount: filteredSales.length, // Total count of sales in the period
+            lowStockCount,
+            outOfStockCount
+        };
+    }, [filteredSales, products]);
+
+    // NEW ANALYTICS CALCULATION (รวม 3 ส่วนที่ร้องขอ)
+    const analyticsData = useMemo(() => {
+        const today = new Date();
+        const ninetyDaysAgo = new Date(today);
+        ninetyDaysAgo.setDate(today.getDate() - 90);
+
+        const currentMonthYear = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+        
+        const monthlySalesCount = {}; // { productId: totalQtySold }
+        const lastSaleDate = {};       // { productId: latestTimestamp }
+        const salesByDate = [];        // Flattened list of recent sales
+
+        // 1. Process all sales for Monthly Aggregation and Last Sale Date
+        sales.forEach(sale => {
+            if (!sale.createdAt?.toDate) return;
+            const saleDate = sale.createdAt.toDate();
+            const saleMonthYear = `${saleDate.getFullYear()}-${String(saleDate.getMonth() + 1).padStart(2, '0')}`;
+
+            sale.items.forEach(item => {
+                const productId = item.id;
+                const qty = item.qty || 0;
+
+                // Monthly Count
+                if (saleMonthYear === currentMonthYear) {
+                    monthlySalesCount[productId] = (monthlySalesCount[productId] || 0) + qty;
+                }
+
+                // Last Sale Date Tracking (Keep the latest date)
+                if (!lastSaleDate[productId] || saleDate > lastSaleDate[productId]) {
+                    lastSaleDate[productId] = saleDate;
+                }
+
+                // Sales By Date (for Latest 5) - only add the item once if it's one of the latest
+                const saleEntry = { productId, name: item.name, date: saleDate };
+                const isItemAlreadyAdded = salesByDate.some(s => s.productId === productId && s.date.getTime() === saleDate.getTime());
+                if (!isItemAlreadyAdded) {
+                    salesByDate.push(saleEntry);
+                }
+            });
+        });
+
+        // 2. Top 3 Best Sellers (This Month)
+        const bestSellers = Object.entries(monthlySalesCount)
+            .map(([productId, totalQty]) => ({
+                name: products.find(p => p.id === productId)?.name || 'N/A',
+                qty: totalQty
+            }))
+            .sort((a, b) => b.qty - a.qty)
+            .slice(0, 3);
+            
+        // 3. Stale Stock (> 90 Days No Sale)
+        const staleStock = products
+            .filter(p => {
+                const stock = p.stockQuantity || 0;
+                if (stock <= 0) return false; // Ignore items that are already sold out
+
+                const lastSold = lastSaleDate[p.id];
+                
+                // Never sold OR Last sold date is older than 90 days ago
+                return !lastSold || lastSold < ninetyDaysAgo;
+            })
+            .sort((a, b) => {
+                 // Sort by value (Cost * Stock) to prioritize high value stale items
+                 const valueA = (a.costPrice || 0) * (a.stockQuantity || 0);
+                 const valueB = (b.costPrice || 0) * (b.stockQuantity || 0);
+                 return valueB - valueA;
+            })
+            .slice(0, 3);
+            
+        // 4. Latest 5 Sales (Unique Items)
+        const latestSales = salesByDate
+            .sort((a, b) => b.date - a.date) // Sort by date DESC
+            .slice(0, 5) // Take top 5 unique sale entries
+            .map(s => s.name);
+
+
+        return {
+            latestSales,
+            bestSellers,
+            staleStock,
+        };
+    }, [products, sales]);
+    // END NEW ANALYTICS
+
+    // NEW: คำนวณและจัดเรียงรายการสินค้าวิกฤต (แดง/เหลือง) (No changes)
+    const criticalStockItems = useMemo(() => {
+        const critical = products.filter(p => {
+            const stock = p.stockQuantity || 0;
+            const min = p.minStockThreshold || 0;
+            return stock <= 0 || (stock > 0 && stock <= min);
+        });
+
+        return critical.sort((a, b) => {
+            const stockA = a.stockQuantity || 0;
+            const stockB = b.stockQuantity || 0;
+            const statusA = stockA <= 0 ? 0 : 1;
+            const statusB = stockB <= 0 ? 0 : 1;
+            
+            if (statusA !== statusB) {
+                return statusA - statusB; 
+            }
+            return a.name.localeCompare(b.name, 'th');
+        });
+    }, [products]);
+
+
+    const stats = [
+        { 
+            label: "ยอดขายรวม (Revenue)", 
+            value: formatCurrency(summary.totalRevenue), 
+            icon: DollarSign, 
+            color: "bg-green-100 text-green-700",
+            desc: "รวมรายได้จากบิลขายในงวดที่เลือก" 
+        },
+        { 
+            label: "กำไรสุทธิ (Profit)", 
+            value: formatCurrency(summary.totalProfit), 
+            icon: TrendingUp, 
+            color: summary.totalProfit >= 0 ? "bg-blue-100 text-blue-700" : "bg-purple-100 text-purple-700",
+            desc: `กำไร/ขาดทุน ในงวดที่เลือก | Margin: ${summary.profitMargin.toFixed(1)}%`
+        },
+        { 
+            label: "สินค้าใกล้หมด (Low Stock)", 
+            value: summary.lowStockCount, 
+            icon: AlertCircle, 
+            color: "bg-yellow-100 text-yellow-700",
+            desc: `สินค้าที่สต็อกต่ำกว่าเกณฑ์แจ้งเตือน (${summary.outOfStockCount} รายการหมดแล้ว)` 
+        },
+        { 
+            label: "จำนวนบิลขาย", 
+            value: summary.totalSalesCount, 
+            icon: List, 
+            color: "bg-teal-100 text-teal-700",
+            desc: `จำนวนบิลที่บันทึกในงวดนี้` 
+        },
+    ];
+
+    return (
+        <div className="space-y-6">
+            <div className="flex justify-between items-start flex-wrap">
+                <h2 className="text-2xl font-bold text-gray-800 flex items-center mb-4 md:mb-0">
+                    <Home className="mr-2" size={28} /> สรุปภาพรวมธุรกิจ
+                </h2>
+                
+                {/* Filter Dropdown (Moved to be beside the title) */}
+                <div className="flex justify-end items-center bg-white p-2 rounded-xl shadow-md border w-full md:w-auto">
+                    <h3 className="text-sm font-bold text-gray-700 mr-2 flex-shrink-0">แสดงข้อมูลสำหรับ:</h3>
+                    <select
+                        value={selectedFilter}
+                        onChange={(e) => setSelectedFilter(e.target.value)}
+                        className="p-1 border border-gray-300 rounded-lg bg-white text-sm font-semibold focus:ring-green-500"
+                    >
+                        <option value="all">ทั้งหมด (All Time)</option>
+                        <option disabled>--- รายปี ---</option>
+                        {availablePeriods.years.map(year => (
+                            <option key={`year-${year}`} value={`year-${year}`}>
+                                ปี {year}
+                            </option>
+                        ))}
+                        <option disabled>--- รายเดือน ---</option>
+                        {availablePeriods.months.map(monthYear => {
+                            const [year, month] = monthYear.split('-');
+                            // Format month year for display in Thai
+                            const date = new Date(year, month - 1);
+                            const formattedMonth = date.toLocaleDateString('th-TH', { month: 'long', year: 'numeric' });
+                            return (
+                                <option key={`month-${monthYear}`} value={`month-${monthYear}`}>
+                                    {formattedMonth}
+                                </option>
+                            );
+                        })}
+                    </select>
+                </div>
+            </div>
+            
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-4 gap-4">
+                {stats.map((stat, index) => (
+                    <div key={index} className={`p-5 rounded-2xl shadow-lg border-b-4 border-opacity-50 ${stat.color.replace('100', '200')}`} style={{ backgroundColor: stat.color.split(' ')[0].replace('bg', '#').replace('100', 'f7f7f7') }}>
+                        <div className="flex items-center">
+                            <stat.icon size={24} className={`mr-3 ${stat.color.split(' ')[1]}`} />
+                            <p className="font-semibold text-gray-600">{stat.label}</p>
+                        </div>
+                        <p className={`mt-3 text-3xl font-extrabold ${stat.color.split(' ')[1]}`}>
+                            {stat.value}
+                        </p>
+                        <p className="text-xs mt-2 text-gray-500">{stat.desc}</p>
+                    </div>
+                ))}
+            </div>
+
+            {/* ANALYTICS SECTION */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                {/* 1. Latest 5 Sales (New Section) */}
+                <div className="bg-white p-5 rounded-2xl shadow-xl border border-gray-100 lg:col-span-1">
+                    <h3 className="text-lg font-bold text-blue-700 mb-3 flex items-center">
+                        <TrendingUp className="mr-2" size={20} /> สินค้าที่ขายล่าสุด 5 รายการ
+                    </h3>
+                    <ul className="text-sm space-y-2">
+                        {analyticsData.latestSales.length > 0 ? (
+                            analyticsData.latestSales.map((name, index) => (
+                                <li key={index} className="flex justify-between items-center border-b pb-1 last:border-b-0 text-gray-700">
+                                    <span className="font-semibold truncate">{index + 1}. {name}</span>
+                                </li>
+                            ))
+                        ) : (
+                            <li className="text-gray-500 italic text-sm">ยังไม่มีรายการขายล่าสุด</li>
+                        )}
+                    </ul>
+                </div>
+                
+                {/* 2. Monthly Best Sellers (New Section) */}
+                <div className="bg-white p-5 rounded-2xl shadow-xl border border-gray-100 lg:col-span-1">
+                    <h3 className="text-lg font-bold text-green-700 mb-3 flex items-center">
+                        <Zap className="mr-2" size={20} /> สินค้าขายดีสุดเดือนนี้ (จำนวนชิ้น)
+                    </h3>
+                    <ul className="text-sm space-y-2">
+                        {analyticsData.bestSellers.length > 0 ? (
+                            analyticsData.bestSellers.map((item, index) => (
+                                <li key={index} className="flex justify-between items-center border-b pb-1 last:border-b-0 text-gray-700">
+                                    <span className="font-semibold truncate">{index + 1}. {item.name}</span>
+                                    <span className="text-green-600 font-extrabold">{item.qty} ชิ้น</span>
+                                </li>
+                            ))
+                        ) : (
+                            <li className="text-gray-500 italic text-sm">ยังไม่มีข้อมูลการขายในเดือนนี้</li>
+                        )}
+                    </ul>
+                </div>
+
+                {/* 3. Stale Stock (> 90 Days) (New Section) */}
+                <div className="bg-white p-5 rounded-2xl shadow-xl border border-gray-100 lg:col-span-1">
+                    <h3 className="text-lg font-bold text-orange-700 mb-3 flex items-center">
+                        <Clock className="mr-2" size={20} /> สินค้าไม่เคลื่อนไหว ({'>'} 90 วัน)
+                    </h3>
+                    <ul className="text-sm space-y-2">
+                         {analyticsData.staleStock.length > 0 ? (
+                            analyticsData.staleStock.map((item, index) => (
+                                <li key={index} className="flex justify-between items-center border-b pb-1 last:border-b-0 text-gray-700">
+                                    <span className="font-semibold truncate">{index + 1}. {item.name}</span>
+                                    <span className="text-orange-600 font-bold">{item.stockQuantity} ชิ้น</span>
+                                </li>
+                            ))
+                        ) : (
+                            <li className="text-gray-500 italic text-sm">ยอดเยี่ยม! ไม่มีสินค้าค้างสต็อก</li>
+                        )}
+                    </ul>
+                </div>
+
+            </div>
+            {/* END ANALYTICS SECTION */}
+
+            <div className="bg-white p-6 rounded-2xl shadow-xl border border-gray-100 mt-6">
+                <h3 className="text-xl font-bold text-red-700 mb-4 flex items-center">
+                    <AlertTriangle className="mr-2" size={24} /> สินค้าใกล้หมด/หมด (ต้องรีบสั่ง!)
+                    <span className="ml-2 px-2 py-1 bg-red-100 text-red-700 rounded-full text-sm font-extrabold">
+                        รวม {criticalStockItems.length} รายการ
+                    </span>
+                </h3>
+                
+                {criticalStockItems.length === 0 ? (
+                    <div className="text-center p-4 bg-green-50 rounded-xl">
+                        <Sprout size={24} className="text-green-500 mx-auto mb-2" />
+                        <p className="text-green-700 font-semibold">ยอดเยี่ยม! สต็อกสินค้าทุกรายการอยู่ในระดับ 'ปกติ' จ้า</p>
+                    </div>
+                ) : (
+                    <div className="space-y-3">
+                        {criticalStockItems.map((product) => {
+                            const stockQty = product.stockQuantity || 0;
+                            const minThreshold = product.minStockThreshold || 0;
+                            const isOutOfStock = stockQty <= 0;
+                            
+                            const borderColor = isOutOfStock ? 'border-red-500 bg-red-50' : 'border-yellow-500 bg-yellow-50';
+                            const textColor = isOutOfStock ? 'text-red-700' : 'text-yellow-700';
+
+                            return (
+                                <div key={product.id} className={`p-3 rounded-xl border-l-4 shadow-sm flex justify-between items-center ${borderColor}`}>
+                                    <div className="flex-grow">
+                                        <p className="font-bold text-gray-800">{product.name}</p>
+                                        <p className="text-xs text-gray-500">แจ้งเตือนเมื่อต่ำกว่า: {minThreshold} ชิ้น</p>
+                                    </div>
+                                    <div className="flex-shrink-0 text-right">
+                                        <span className={`text-lg font-extrabold ${textColor}`}>
+                                            {stockQty} ชิ้น
+                                        </span>
+                                        <p className="text-xs font-semibold">
+                                            {isOutOfStock ? '(หมดแล้ว!)' : '(เหลือไม่ถึงเกณฑ์)'}
+                                        </p>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                        <p className="text-sm text-gray-500 pt-2 text-center">
+                            *กรุณาไปที่แท็บ **'รายการสินค้า'** เพื่อดูรายละเอียดและจัดการสต็อก
+                        </p>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+
+// --- 4. Tab: Admin Pin Manager --- 
+const AdminPinManager = ({ db, userId, currentPin, onPinUpdate, sales, startResetAllData }) => {
+    const [newPin, setNewPin] = useState('');
+    const [confirmPin, setConfirmPin] = useState('');
+    const [message, setMessage] = useState('');
+    const [isSaving, setIsSaving] = useState(false);
+    
+    // Export State
+    const [exportFilter, setExportFilter] = useState('all'); 
+
+    const handleSavePin = async (e) => {
+        e.preventDefault();
+        setMessage('');
+        
+        if (newPin.length !== PIN_LENGTH || confirmPin.length !== PIN_LENGTH) {
+            setMessage(`PIN ต้องมี ${PIN_LENGTH} หลักเท่านั้น!`);
+            return;
+        }
+        if (newPin !== confirmPin) {
+            setMessage('PIN ยืนยันไม่ตรงกัน!');
+            return;
+        }
+
+        setIsSaving(true);
+        try {
+            const configRef = doc(db, `/artifacts/${appId}/users/${userId}/${CONFIG_DOC_PATH}`);
+            await setDoc(configRef, { 
+                pin: newPin,
+                updatedAt: serverTimestamp()
+            }, { merge: true });
+            
+            onPinUpdate(newPin); 
+            setMessage('ตั้งค่า PIN ใหม่สำเร็จแล้ว! ห้ามลืมเด็ดขาดนะจ๊ะ!');
+            setNewPin('');
+            setConfirmPin('');
+        } catch (error) {
+            console.error("Error setting PIN: ", error);
+            setMessage('ตั้งค่า PIN ไม่สำเร็จ: ' + error.message);
+        } finally {
+            setIsSaving(false);
+        }
+    };
+    
+    // Calculate unique periods available for filtering
+    const availablePeriods = useMemo(() => {
+        const months = new Set();
+        const years = new Set();
+        sales.forEach(sale => {
+            if (sale.createdAt?.toDate) {
+                const date = sale.createdAt.toDate();
+                const year = date.getFullYear().toString();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                
+                months.add(`${year}-${month}`);
+                years.add(year);
+            }
+        });
+        
+        return {
+            months: Array.from(months).sort().reverse(),
+            years: Array.from(years).sort().reverse()
+        };
+    }, [sales]);
+
+    // Export Logic
+    const exportSalesData = () => {
+        const filteredSales = sales.filter(sale => {
+            if (exportFilter === 'all') return true;
+
+            if (!sale.createdAt?.toDate) return false;
+            const date = sale.createdAt.toDate();
+            const year = date.getFullYear().toString();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const yearMonth = `${year}-${month}`;
+
+            // Filter logic is based on YYYY or YYYY-MM
+            if (exportFilter.startsWith('year-') && year === exportFilter.substring(5)) return true;
+            if (exportFilter.startsWith('month-') && yearMonth === exportFilter.substring(6)) return true;
+            
+            return false;
+        });
+        
+        if (filteredSales.length === 0) {
+            alert('ไม่พบรายการขายในช่วงเวลาที่เลือก');
+            return;
+        }
+
+        let csvContent = "data:text/csv;charset=utf-8,\uFEFF"; // \uFEFF is BOM for proper Excel encoding
+        const headers = [
+            "Bill ID", 
+            "Date", 
+            "Subtotal", 
+            "Discount", 
+            "Total Revenue", 
+            "COGS (Cost of Goods Sold)", 
+            "Profit", 
+            "Item Details"
+        ];
+        csvContent += headers.join(",") + "\n";
+
+        filteredSales.forEach(sale => {
+            const saleDate = sale.createdAt?.toDate ? sale.createdAt.toDate().toLocaleDateString('th-TH', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : 'N/A';
+            
+            // Format item details for a single cell
+            const itemDetails = sale.items.map(item => 
+                `${item.name} x${item.qty} (@${item.unitPrice})`
+            ).join('; ');
+            
+            const row = [
+                `"${sale.billId}"`,
+                `"${saleDate}"`,
+                sale.subtotal,
+                sale.discount,
+                sale.totalRevenue,
+                sale.totalCostOfGoodsSold,
+                sale.profit,
+                `"${itemDetails}"`
+            ];
+            csvContent += row.join(",") + "\n";
+        });
+
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        
+        const filterName = exportFilter === 'all' ? 'ทั้งหมด' : exportFilter;
+        link.setAttribute("download", `Sales_Report_${filterName}.csv`);
+        
+        document.body.appendChild(link); // Required for Firefox
+        link.click(); 
+        document.body.removeChild(link);
+    };
+
+    return (
+        <div className="space-y-6">
+            <div className="bg-yellow-50 p-6 rounded-2xl shadow-xl border border-yellow-200">
+                <h2 className="text-xl font-bold text-yellow-700 mb-4 flex items-center">
+                    <Key className="mr-2" size={24} /> ตั้งค่ารหัส PIN (Admin Security)
+                </h2>
+                
+                <p className="text-sm text-yellow-600 mb-4">
+                    รหัส PIN {PIN_LENGTH} หลักนี้จำเป็นสำหรับยืนยันการดำเนินการสำคัญ เช่น ลบข้อมูล
+                </p>
+
+                <div className="mb-4">
+                    <span className="font-bold text-gray-700 mr-2">รหัส PIN ปัจจุบัน:</span>
+                    <span className={`font-mono text-xl font-extrabold px-3 py-1 rounded-md ${currentPin ? 'bg-green-200 text-green-800' : 'bg-red-200 text-red-800'}`}>
+                        {currentPin ? '****' : 'ยังไม่ได้ตั้งค่า! ต้องตั้งก่อนถึงจะลบได้!'}
+                    </span>
+                </div>
+                
+                <form onSubmit={handleSavePin} className="space-y-3">
+                    <input
+                        type="password"
+                        placeholder={`PIN ใหม่ (${PIN_LENGTH} หลัก)`}
+                        value={newPin}
+                        onChange={(e) => setNewPin(e.target.value.replace(/[^0-9]/g, '').slice(0, PIN_LENGTH))}
+                        maxLength={PIN_LENGTH}
+                        className="w-full p-3 border border-gray-300 rounded-xl focus:ring-yellow-500 focus:border-yellow-500 font-mono text-center"
+                        required
+                    />
+                    <input
+                        type="password"
+                        placeholder={`ยืนยัน PIN ใหม่ (${PIN_LENGTH} หลัก)`}
+                        value={confirmPin}
+                        onChange={(e) => setConfirmPin(e.target.value.replace(/[^0-9]/g, '').slice(0, PIN_LENGTH))}
+                        maxLength={PIN_LENGTH}
+                        className="w-full p-3 border border-gray-300 rounded-xl focus:ring-yellow-500 focus:border-yellow-500 font-mono text-center"
+                        required
+                    />
+                    <button
+                        type="submit"
+                        className="w-full px-6 py-3 bg-yellow-500 text-white font-bold rounded-xl shadow-lg hover:bg-yellow-600 transition duration-200 disabled:bg-yellow-300 flex justify-center items-center"
+                        disabled={isSaving || newPin.length !== PIN_LENGTH || confirmPin.length !== PIN_LENGTH}
+                    >
+                        {isSaving ? (
+                            <>
+                                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
+                                กำลังบันทึก...
+                            </>
+                        ) : 'บันทึก PIN ใหม่'}
+                    </button>
+                    {message && (
+                        <p className={`text-sm font-semibold text-center pt-2 ${message.includes('สำเร็จ') ? 'text-green-600' : 'text-red-600'}`}>
+                            {message}
+                        </p>
+                    )}
+                </form>
+            </div>
+            
+            {/* Export Sales Data Section */}
+            <div className="bg-white p-6 rounded-2xl shadow-xl border border-blue-100">
+                <h2 className="text-xl font-bold text-blue-700 mb-4 flex items-center">
+                    <Printer className="mr-2" size={24} /> รายงานการขาย (Export)
+                </h2>
+                <p className="text-sm text-gray-600 mb-4">
+                    เลือกช่วงเวลาที่ต้องการ Export รายละเอียดบิลขายเป็นไฟล์ CSV (เปิดใน Excel ได้)
+                </p>
+
+                <div className="flex flex-col sm:flex-row gap-3 items-center">
+                    <select
+                        value={exportFilter}
+                        onChange={(e) => setExportFilter(e.target.value)}
+                        className="w-full sm:w-auto p-3 border border-gray-300 rounded-xl bg-white text-sm font-semibold focus:ring-blue-500 flex-grow"
+                    >
+                        <option value="all">ทั้งหมด (All Time)</option>
+                        <option disabled>--- รายปี ---</option>
+                        {availablePeriods.years.map(year => (
+                            <option key={`export-year-${year}`} value={`year-${year}`}>
+                                ปี {year}
+                            </option>
+                        ))}
+                        <option disabled>--- รายเดือน ---</option>
+                        {availablePeriods.months.map(monthYear => {
+                            const [year, month] = monthYear.split('-');
+                            const date = new Date(year, month - 1);
+                            const formattedMonth = date.toLocaleDateString('th-TH', { month: 'long', year: 'numeric' });
+                            return (
+                                <option key={`export-month-${monthYear}`} value={`month-${monthYear}`}>
+                                    {formattedMonth}
+                                </option>
+                            );
+                        })}
+                    </select>
+
+                    <button
+                        onClick={exportSalesData}
+                        className="w-full sm:w-auto px-6 py-3 bg-blue-500 text-white font-bold rounded-xl shadow-lg hover:bg-blue-600 transition duration-200 disabled:bg-blue-300 flex justify-center items-center"
+                        disabled={sales.length === 0}
+                    >
+                        <DownloadCloud size={20} className="mr-2" /> Export เป็นไฟล์ Excel (.CSV)
+                    </button>
+                </div>
+                {sales.length === 0 && <p className="text-sm text-red-500 mt-2">ยังไม่มีข้อมูลการขายให้ Export</p>}
+            </div>
+
+            {/* NEW: Data Reset Section */}
+            <div className="bg-red-50 p-6 rounded-2xl shadow-xl border border-red-200">
+                <h2 className="text-xl font-bold text-red-700 mb-4 flex items-center">
+                    <Trash2 className="mr-2" size={24} /> ล้างข้อมูลทั้งหมด (Dangerous Zone!)
+                </h2>
+                <p className="text-sm text-red-600 mb-4">
+                    การดำเนินการนี้จะลบข้อมูล **สินค้า บิลขาย รายการรับเข้า และหมวดหมู่** ทั้งหมดของร้านหลักเกษตร คุระบุรี อย่างถาวร! ไม่สามารถกู้คืนได้!
+                </p>
+
+                <button
+                    onClick={startResetAllData}
+                    className="w-full px-6 py-3 bg-red-600 text-white font-bold rounded-xl shadow-lg hover:bg-red-700 transition duration-200 disabled:bg-red-300 flex justify-center items-center"
+                    disabled={!currentPin} // Ensure PIN is set before allowing reset attempt
+                >
+                    <AlertTriangle size={20} className="mr-2" /> ยืนยัน PIN เพื่อล้างข้อมูลทั้งหมด
+                </button>
+                {!currentPin && <p className="text-sm text-red-500 mt-2 text-center">**กรุณาตั้งค่า PIN ก่อนใช้งานฟังก์ชันนี้**</p>}
+            </div>
+        </div>
+    );
+};
+// --- 5. Tab: Category Manager ---
+
+const CategoryManager = ({ db, userId, categories, startDelete }) => {
+    const [newCategoryName, setNewCategoryName] = useState('');
+    const [editingCategoryId, setEditingCategoryId] = useState(null);
+    const [editingCategoryName, setEditingCategoryName] = useState('');
+    const [addError, setAddError] = useState(null);
+
+    const handleAddCategory = async (e) => {
+        e.preventDefault();
+        setAddError(null);
+        if (!newCategoryName.trim() || !db || !userId) return;
+
+        try {
+            const categoriesCollectionPath = `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.categories}`;
+            await addDoc(collection(db, categoriesCollectionPath), {
+                name: newCategoryName.trim(),
+                createdAt: serverTimestamp(),
+            });
+            setNewCategoryName('');
+        } catch (e) {
+            console.error("Error adding document: ", e);
+            setAddError("เพิ่มหมวดหมู่ไม่สำเร็จ");
+        }
+    };
+
+    const startEdit = (category) => {
+        setEditingCategoryId(category.id);
+        setEditingCategoryName(category.name);
+    };
+
+    const cancelEdit = () => {
+        setEditingCategoryId(null);
+        setEditingCategoryName('');
+    };
+
+    const handleEditCategory = async (id) => {
+        setAddError(null);
+        if (!editingCategoryName.trim() || !db || !userId) return;
+
+        try {
+            const categoriesDocRef = doc(db, `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.categories}`, id);
+            await updateDoc(categoriesDocRef, {
+                name: editingCategoryName.trim(),
+                updatedAt: serverTimestamp()
+            });
+            cancelEdit();
+        } catch (e) {
+            console.error("Error updating document: ", e);
+            setAddError("แก้ไขหมวดหมู่ไม่สำเร็จ");
+        }
+    };
+    
+    const CategoryItem = ({ category }) => {
+        const isEditing = editingCategoryId === category.id;
+
+        return (
+            <div className="flex items-center justify-between p-4 bg-white border-b border-gray-100 last:border-b-0">
+                {isEditing ? (
+                    <input
+                        type="text"
+                        value={editingCategoryName}
+                        onChange={(e) => setEditingCategoryName(e.target.value)}
+                        className="flex-grow p-2 border border-green-300 rounded-lg focus:ring-2 focus:ring-green-500 transition duration-150"
+                        placeholder="ชื่อหมวดหมู่ใหม่"
+                    />
+                ) : (
+                    <span className="text-gray-800 font-medium text-lg truncate pr-4">{category.name}</span>
+                )}
+                
+                <div className="flex space-x-2">
+                    {isEditing ? (
+                        <>
+                            <button
+                                onClick={() => handleEditCategory(category.id)}
+                                className="p-2 bg-green-500 text-white rounded-full shadow-md hover:bg-green-600 transition duration-150 transform hover:scale-105"
+                                title="บันทึก"
+                                disabled={!editingCategoryName.trim()}
+                            >
+                                <Save size={20} />
+                            </button>
+                            <button
+                                onClick={cancelEdit}
+                                className="p-2 bg-gray-400 text-white rounded-full shadow-md hover:bg-gray-500 transition duration-150 transform hover:scale-105"
+                                title="ยกเลิก"
+                            >
+                                <X size={20} />
+                            </button>
+                        </>
+                    ) : (
+                        <>
+                            <button
+                                onClick={() => startEdit(category)}
+                                className="p-2 bg-yellow-500 text-white rounded-full shadow-md hover:bg-yellow-600 transition duration-150 transform hover:scale-105"
+                                title="แก้ไข"
+                            >
+                                <Edit size={20} />
+                            </button>
+                            <button
+                                onClick={() => startDelete(category, 'ลบหมวดหมู่', COLLECTION_PATHS.categories)} 
+                                className="p-2 bg-red-500 text-white rounded-full shadow-md hover:bg-red-600 transition duration-150 transform hover:scale-105"
+                                title="ลบ (ต้องใช้ PIN ยืนยัน)"
+                            >
+                                <Trash2 size={20} />
+                            </button>
+                        </>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+
+    return (
+        <div className="space-y-6">
+            <section className="bg-white p-6 rounded-2xl shadow-xl border border-green-100">
+                <h2 className="text-xl font-semibold text-green-600 mb-4 flex items-center">
+                    <Plus className="mr-2" size={24} /> เพิ่มหมวดหมู่ใหม่
+                </h2>
+                <form onSubmit={handleAddCategory} className="flex flex-col sm:flex-row gap-3">
+                    <input
+                        type="text"
+                        value={newCategoryName}
+                        onChange={(e) => setNewCategoryName(e.target.value)}
+                        placeholder="เช่น: ปุ๋ยอินทรีย์, ยาฆ่าเชื้อรา"
+                        className="flex-grow p-3 border border-gray-300 rounded-xl focus:ring-green-500 focus:border-green-500 transition duration-150 text-gray-700"
+                        required
+                    />
+                    <button
+                        type="submit"
+                        className="w-full sm:w-auto px-6 py-3 bg-green-500 text-white font-bold rounded-xl shadow-lg hover:bg-green-600 transition duration-200 disabled:bg-green-300"
+                        disabled={!newCategoryName.trim()}
+                    >
+                        เพิ่มหมวดหมู่
+                    </button>
+                </form>
+                {addError && <p className="text-red-500 text-sm mt-2">{addError}</p>}
+            </section>
+
+            <section className="bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden">
+                <h2 className="text-xl font-semibold text-gray-700 p-4 border-b bg-gray-50 flex items-center">
+                    <List className="mr-2" size={20} /> รายการหมวดหมู่ ({categories.length} หมวดหมู่)
+                </h2>
+                {categories.length === 0 ? (
+                    <p className="p-6 text-center text-gray-500">ยังไม่มีหมวดหมู่ ลองเพิ่มหมวดหมู่สินค้าดูนะจ๊ะ!</p>
+                ) : (
+                    <div className="divide-y divide-gray-100">
+                        {categories.map((category) => (
+                            <CategoryItem key={category.id} category={category} />
+                        ))}
+                    </div>
+                )}
+            </section>
+        </div>
+    );
+};
+
+// --- 6. Tab: Product Manager (รายการสินค้า) ---
+
+const ProductManager = ({ db, userId, products, categories, startDelete }) => {
+    // FIX: Change default values to empty strings to show placeholders
+    const [newProduct, setNewProduct] = useState({ 
+        name: '', 
+        costPrice: '', 
+        sellingPrice: '', 
+        categoryId: '', 
+        stockQuantity: '', // Changed from 0
+        minStockThreshold: '' // Changed from 10
+    });
+    const [addError, setAddError] = useState(null);
+    
+    // NEW STATE: Filter by Category
+    const [selectedCategoryFilter, setSelectedCategoryFilter] = useState('all'); 
+
+    // NEW STATES for editing
+    const [editingProductId, setEditingProductId] = useState(null);
+    const [editProductData, setEditProductData] = useState({});
+
+    // Handler for adding new product (No changes)
+    const handleAddProduct = async (e) => {
+        e.preventDefault();
+        setAddError(null);
+        
+        const { name, costPrice, sellingPrice, categoryId, stockQuantity, minStockThreshold } = newProduct;
+
+        if (!name.trim() || !costPrice || !sellingPrice || !categoryId || !db || !userId) {
+             setAddError("กรุณากรอกข้อมูลสินค้าให้ครบถ้วน!");
+             return;
+        }
+
+        try {
+            const productsCollectionPath = `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.products}`;
+            await addDoc(collection(db, productsCollectionPath), {
+                name: name.trim(),
+                costPrice: parseFloat(costPrice), 
+                sellingPrice: parseFloat(sellingPrice), 
+                categoryId: categoryId,
+                // These default to 0 and 10 respectively if the input string is empty (NaN)
+                stockQuantity: parseFloat(stockQuantity) || 0,
+                minStockThreshold: parseFloat(minStockThreshold) || 10, 
+                createdAt: serverTimestamp(),
+            });
+            // FIX: Reset input fields to empty strings after successful add
+            setNewProduct({ name: '', costPrice: '', sellingPrice: '', categoryId: '', stockQuantity: '', minStockThreshold: '' });
+        } catch (e) {
+            console.error("Error adding product: ", e);
+            setAddError("เพิ่มสินค้าไม่สำเร็จ");
+        }
+    };
+    
+    // NEW EDIT HANDLERS
+    const startEdit = (product) => {
+        setEditingProductId(product.id);
+        // Convert numbers to string for input fields
+        setEditProductData({
+            id: product.id,
+            name: product.name,
+            costPrice: (product.costPrice || '').toString(),
+            sellingPrice: (product.sellingPrice || '').toString(),
+            categoryId: product.categoryId,
+            stockQuantity: (product.stockQuantity === 0 ? '' : product.stockQuantity || '').toString(), // Show empty string if 0 for edit clarity
+            minStockThreshold: (product.minStockThreshold === 10 ? '' : product.minStockThreshold || '').toString(), // Show empty string if default for edit clarity
+        });
+        setAddError(null); // Clear previous error
+    };
+
+    const cancelEdit = () => {
+        setEditingProductId(null);
+        setEditProductData({});
+        setAddError(null);
+    };
+
+    const handleUpdateProduct = async () => {
+        setAddError(null);
+        const { id, name, costPrice, sellingPrice, categoryId, stockQuantity, minStockThreshold } = editProductData;
+
+        if (!name.trim() || !costPrice || !sellingPrice || !categoryId) {
+            setAddError("กรุณากรอกข้อมูลสินค้าให้ครบถ้วนก่อนบันทึก!");
+            return;
+        }
+
+        try {
+            const productsDocRef = doc(db, `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.products}`, id);
+            
+            await updateDoc(productsDocRef, {
+                name: name.trim(),
+                costPrice: parseFloat(costPrice),
+                sellingPrice: parseFloat(sellingPrice),
+                categoryId: categoryId,
+                // Parse string inputs, use default 0/10 if empty string (NaN)
+                stockQuantity: parseFloat(stockQuantity) || 0,
+                minStockThreshold: parseFloat(minStockThreshold) || 10,
+                updatedAt: serverTimestamp(),
+            });
+
+            cancelEdit(); // Close editing mode
+        } catch (e) {
+            console.error("Error updating product: ", e);
+            setAddError("แก้ไขสินค้าไม่สำเร็จ: " + e.message);
+        }
+    };
+
+    // Logic การจัดเรียง: แดง > เหลือง > อื่นๆ + การกรองหมวดหมู่
+    const sortedAndFilteredProducts = useMemo(() => {
+        let list = products;
+        
+        // 1. Filtering by Category
+        if (selectedCategoryFilter !== 'all') {
+            list = list.filter(p => p.categoryId === selectedCategoryFilter);
+        }
+
+        // 2. Sorting Logic: แดง > เหลือง > อื่นๆ
+        const getStockStatus = (product) => {
+            const stock = product.stockQuantity || 0;
+            const min = product.minStockThreshold || 0;
+
+            if (stock <= 0) return 0; // Red/Out of Stock
+            if (stock <= min) return 1; // Yellow/Low Stock
+            return 2; // Normal
+        };
+
+        return list.sort((a, b) => {
+            const statusA = getStockStatus(a);
+            const statusB = getStockStatus(b);
+            
+            if (statusA !== statusB) {
+                return statusA - statusB; // 0 < 1 < 2 (Red -> Yellow -> Normal)
+            }
+            return a.name.localeCompare(b.name, 'th'); // Then sort by name
+        });
+    }, [products, selectedCategoryFilter]);
+
+
+    // UI สำหรับแสดงรายการสินค้า - REFRACTORED FOR EDITING
+    const ProductItem = ({ product }) => {
+        const category = categories.find(cat => cat.id === product.categoryId);
+        const profitPerUnit = product.sellingPrice - product.costPrice;
+        const isEditing = editingProductId === product.id;
+        
+        const stockQty = product.stockQuantity || 0;
+        const minThreshold = product.minStockThreshold || 0;
+
+        const isOutOfStock = stockQty <= 0;
+        const isLowStock = stockQty > 0 && stockQty <= minThreshold;
+        
+        const stockClasses = isOutOfStock 
+            ? 'bg-red-500 text-white' 
+            : isLowStock 
+                ? 'bg-yellow-500 text-gray-800' 
+                : 'bg-green-500 text-white'; 
+        
+        const stockIcon = isOutOfStock ? <AlertTriangle size={16} /> : isLowStock ? <AlertCircle size={16} /> : <Zap size={16} />;
+
+        // Content when not editing
+        if (!isEditing) {
+            return (
+                <div className={`flex items-center justify-between p-4 bg-white border-b border-gray-100 last:border-b-0 text-sm ${isOutOfStock ? 'border-l-4 border-red-500' : isLowStock ? 'border-l-4 border-yellow-500' : ''}`}>
+                    <div className="flex-grow min-w-0">
+                        <p className="font-semibold text-gray-800 truncate">{product.name}</p>
+                        <p className="text-gray-500 text-xs">
+                            {category ? category.name : 'ไม่มีหมวดหมู่'}
+                        </p>
+                        <div className="mt-1 flex space-x-4 text-xs">
+                            <span className="text-blue-600 font-bold">ทุน: {formatCurrency(product.costPrice || 0)}</span>
+                            <span className="text-green-600 font-bold">ขาย: {formatCurrency(product.sellingPrice || 0)}</span>
+                            <span className={`font-bold ${profitPerUnit >= 0 ? 'text-teal-600' : 'text-red-600'}`}>
+                                กำไร/ชิ้น: {formatCurrency(profitPerUnit)}
+                            </span>
+                        </div>
+                    </div>
+                    
+                    <div className="flex flex-col items-end space-y-1">
+                        <div className={`flex items-center px-2 py-1 rounded-full text-xs font-bold ${stockClasses}`}>
+                            {stockIcon}
+                            <span className="ml-1">
+                                สต็อก: {stockQty} {isOutOfStock ? '(หมด)' : isLowStock ? `(<${minThreshold})` : '(ปกติ)'}
+                            </span>
+                        </div>
+                        <div className="flex space-x-1">
+                            <button
+                                onClick={() => startEdit(product)}
+                                className="p-1.5 bg-yellow-500 text-white rounded-full shadow-md hover:bg-yellow-600 transition duration-150 transform hover:scale-105"
+                                title="แก้ไข"
+                            >
+                                <Edit size={16} />
+                            </button>
+                            <button
+                                onClick={() => startDelete(product, 'ลบรายการสินค้า', COLLECTION_PATHS.products)}
+                                className="p-1.5 bg-red-500 text-white rounded-full shadow-md hover:bg-red-600 transition duration-150 transform hover:scale-105"
+                                title="ลบรายการสินค้า (ต้องใช้ PIN ยืนยัน)"
+                            >
+                                <Trash2 size={16} />
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Content when editing
+        return (
+            <div className="p-4 bg-yellow-50 border-b border-yellow-200 last:border-b-0">
+                 <h4 className="font-bold text-sm mb-2 text-yellow-700">กำลังแก้ไข: {product.name}</h4>
+                 <div className="grid grid-cols-2 gap-3 mb-2 text-xs">
+                    <input
+                        type="text"
+                        value={editProductData.name}
+                        onChange={(e) => setEditProductData({ ...editProductData, name: e.target.value })}
+                        placeholder="ชื่อสินค้า"
+                        className="p-2 border rounded-lg"
+                    />
+                    <select
+                        value={editProductData.categoryId}
+                        onChange={(e) => setEditProductData({ ...editProductData, categoryId: e.target.value })}
+                        className="p-2 border rounded-lg bg-white"
+                    >
+                        <option value="" disabled>เลือกหมวดหมู่</option>
+                        {categories.map(cat => (
+                            <option key={cat.id} value={cat.id}>{cat.name}</option>
+                        ))}
+                    </select>
+                    <input
+                        type="number"
+                        value={editProductData.costPrice}
+                        onChange={(e) => setEditProductData({ ...editProductData, costPrice: e.target.value })}
+                        placeholder="ราคาทุน"
+                        className="p-2 border rounded-lg"
+                        min="0.01"
+                        step="0.01"
+                    />
+                    <input
+                        type="number"
+                        value={editProductData.sellingPrice}
+                        onChange={(e) => setEditProductData({ ...editProductData, sellingPrice: e.target.value })}
+                        placeholder="ราคาขาย"
+                        className="p-2 border rounded-lg"
+                        min="0.01"
+                        step="0.01"
+                    />
+                    <input
+                        type="number"
+                        value={editProductData.stockQuantity}
+                        onChange={(e) => setEditProductData({ ...editProductData, stockQuantity: e.target.value })}
+                        placeholder="สต็อกปัจจุบัน"
+                        className="p-2 border rounded-lg"
+                        min="0"
+                    />
+                    <input
+                        type="number"
+                        value={editProductData.minStockThreshold}
+                        onChange={(e) => setEditProductData({ ...editProductData, minStockThreshold: e.target.value })}
+                        placeholder="เกณฑ์แจ้งเตือนสต็อกต่ำ"
+                        className="p-2 border rounded-lg"
+                        min="0"
+                    />
+                 </div>
+                 <div className="flex space-x-2 justify-end">
+                    <button
+                        onClick={handleUpdateProduct}
+                        className="px-3 py-1 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 transition disabled:bg-green-300"
+                        disabled={!editProductData.name || !editProductData.costPrice || !editProductData.sellingPrice}
+                    >
+                        <Save size={16} className="inline mr-1" /> บันทึก
+                    </button>
+                    <button
+                        onClick={cancelEdit}
+                        className="px-3 py-1 bg-gray-400 text-white rounded-lg font-semibold hover:bg-gray-500 transition"
+                    >
+                        <X size={16} className="inline mr-1" /> ยกเลิก
+                    </button>
+                 </div>
+            </div>
+        );
+    };
+
+    return (
+        <div className="space-y-6">
+            <section className="bg-white p-6 rounded-2xl shadow-xl border border-blue-100">
+                <h2 className="text-xl font-semibold text-blue-600 mb-4 flex items-center">
+                    <Plus className="mr-2" size={24} /> เพิ่มรายการสินค้าใหม่ (พร้อมสต็อก)
+                </h2>
+                <form onSubmit={handleAddProduct} className="space-y-3">
+                    <input
+                        type="text"
+                        value={newProduct.name}
+                        onChange={(e) => setNewProduct({ ...newProduct, name: e.target.value })}
+                        placeholder="ชื่อสินค้า (เช่น: ปุ๋ยอินทรีย์ 20kg)"
+                        className="w-full p-3 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500"
+                        required
+                    />
+                    <div className="grid grid-cols-2 gap-3">
+                        <input
+                            type="number"
+                            value={newProduct.costPrice}
+                            onChange={(e) => setNewProduct({ ...newProduct, costPrice: e.target.value })}
+                            placeholder="ราคาทุนต่อหน่วย (บาท)"
+                            className="p-3 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500"
+                            min="0.01"
+                            step="0.01"
+                            required
+                        />
+                        <input
+                            type="number"
+                            value={newProduct.sellingPrice}
+                            onChange={(e) => setNewProduct({ ...newProduct, sellingPrice: e.target.value })}
+                            placeholder="ราคาขายต่อหน่วย (บาท)"
+                            className="p-3 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500"
+                            min="0.01"
+                            step="0.01"
+                            required
+                        />
+                    </div>
+                    
+                    <div className="grid grid-cols-2 gap-3">
+                        <input
+                            type="number"
+                            value={newProduct.stockQuantity}
+                            onChange={(e) => setNewProduct({ ...newProduct, stockQuantity: e.target.value })}
+                            placeholder="จำนวนสต็อกปัจจุบัน"
+                            className="p-3 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500"
+                            min="0"
+                            required
+                        />
+                        <input
+                            type="number"
+                            value={newProduct.minStockThreshold}
+                            onChange={(e) => setNewProduct({ ...newProduct, minStockThreshold: e.target.value })}
+                            placeholder="เกณฑ์แจ้งเตือนสต็อกต่ำกว่า (Min Stock)"
+                            className="p-3 border border-gray-300 rounded-xl focus:ring-yellow-500 focus:border-yellow-500"
+                            min="0"
+                            required
+                        />
+                    </div>
+
+                     <select
+                        value={newProduct.categoryId}
+                        onChange={(e) => setNewProduct({ ...newProduct, categoryId: e.target.value })}
+                        className="w-full p-3 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500 bg-white"
+                        required
+                    >
+                        <option value="" disabled>เลือกหมวดหมู่</option>
+                        {categories.map(cat => (
+                            <option key={cat.id} value={cat.id}>{cat.name}</option>
+                        ))}
+                    </select>
+                   
+                    <button
+                        type="submit"
+                        className="w-full px-6 py-3 bg-blue-500 text-white font-bold rounded-xl shadow-lg hover:bg-blue-600 transition duration-200 disabled:bg-blue-300"
+                        disabled={!newProduct.name.trim() || !newProduct.costPrice || !newProduct.sellingPrice || !newProduct.categoryId}
+                    >
+                        บันทึกสินค้า
+                    </button>
+                </form>
+                {addError && <p className="text-red-500 text-sm mt-2 text-center">{addError}</p>}
+            </section>
+
+            <section className="bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden">
+                <h2 className="text-xl font-semibold text-gray-700 p-4 border-b bg-gray-50 flex items-center">
+                    <Package className="mr-2" size={20} /> รายการสินค้าทั้งหมด ({products.length} รายการ)
+                </h2>
+                
+                {/* NEW: Category Filter */}
+                <div className="p-4 border-b bg-gray-50 flex items-center">
+                    <label htmlFor="categoryFilter" className="text-sm font-medium text-gray-700 mr-2">กรองตามหมวดหมู่:</label>
+                    <select
+                        id="categoryFilter"
+                        value={selectedCategoryFilter}
+                        onChange={(e) => setSelectedCategoryFilter(e.target.value)}
+                        className="p-2 border border-gray-300 rounded-lg bg-white text-sm focus:ring-green-500"
+                    >
+                        <option value="all">-- ดูทั้งหมด --</option>
+                        {categories.map(cat => (
+                            <option key={cat.id} value={cat.id}>{cat.name}</option>
+                        ))}
+                    </select>
+                </div>
+
+                {products.length === 0 ? (
+                    <p className="p-6 text-center text-gray-500">ยังไม่มีรายการสินค้า</p>
+                ) : (
+                    <div className="divide-y divide-gray-100">
+                        {sortedAndFilteredProducts.map((product) => (
+                            <ProductItem key={product.id} product={product} />
+                        ))}
+                    </div>
+                )}
+                
+                {/* Display any error related to editing/adding here */}
+                {addError && !editingProductId && (
+                    <p className="p-4 text-red-500 text-sm text-center font-semibold">{addError}</p>
+                )}
+            </section>
+        </div>
+    );
+};
+
+
+// --- 7. Tab: Goods Receipt Manager (NEW COMPONENT) ---
+
+const GoodsReceiptManager = ({ db, userId, products, receipts, startDelete, receiveProductStock }) => {
+    const [newReceipt, setNewReceipt] = useState({
+        date: new Date().toISOString().substring(0, 10), // Today's date YYYY-MM-DD
+        productId: '',
+        quantity: '', // FIX 1: Change initial quantity to ''
+        unitCost: '',
+        notes: '' // NEW: Notes field
+    });
+    const [receiptError, setReceiptError] = useState(null);
+    const [isSaving, setIsSaving] = useState(false);
+    const [selectedFilter, setSelectedFilter] = useState('all');
+
+    // Calculate Total Cost for the form
+    const totalCost = useMemo(() => {
+        const qty = parseFloat(newReceipt.quantity) || 0;
+        const cost = parseFloat(newReceipt.unitCost) || 0;
+        return qty * cost;
+    }, [newReceipt.quantity, newReceipt.unitCost]);
+
+    // Handle initial selection (Set unitCost when product is selected)
+    useEffect(() => {
+        if (newReceipt.productId) {
+            const selectedProduct = products.find(p => p.id === newReceipt.productId);
+            if (selectedProduct) {
+                // Set the current costPrice as the default unitCost
+                setNewReceipt(prev => ({ 
+                    ...prev, 
+                    unitCost: (selectedProduct.costPrice || 0).toString() 
+                }));
+            }
+        }
+    }, [newReceipt.productId, products]);
+
+
+    const handleSaveReceipt = async (e) => {
+        e.preventDefault();
+        setReceiptError(null);
+        
+        const { date, productId, quantity, unitCost, notes } = newReceipt;
+        const parsedQuantity = parseFloat(quantity) || 0;
+        const parsedUnitCost = parseFloat(unitCost) || 0;
+
+        if (!date || !productId || parsedQuantity <= 0 || parsedUnitCost <= 0 || !db || !userId) {
+             setReceiptError("กรุณากรอกข้อมูลรับเข้าให้ครบถ้วนและถูกต้อง!");
+             return;
+        }
+
+        setIsSaving(true);
+        try {
+            // 1. Save Receipt Document
+            const receiptsCollectionPath = `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.goodsReceipts}`;
+            const receiptDoc = {
+                date: date,
+                productId: productId,
+                productName: products.find(p => p.id === productId)?.name || 'ไม่พบสินค้า',
+                quantity: parsedQuantity, 
+                unitCost: parsedUnitCost, 
+                totalCost: totalCost,
+                notes: notes.trim(), // SAVE NOTES
+                createdAt: serverTimestamp(),
+            };
+            await addDoc(collection(db, receiptsCollectionPath), receiptDoc);
+            
+            // 2. Update Product Stock and Cost Price
+            await receiveProductStock(productId, parsedQuantity, parsedUnitCost);
+
+            // 3. Reset form
+            setNewReceipt({ 
+                date: new Date().toISOString().substring(0, 10), 
+                productId: '', 
+                quantity: '', // FIX: Reset to ''
+                unitCost: '',
+                notes: '' // Reset notes
+            });
+            setReceiptError(null);
+
+        } catch (e) {
+            console.error("Error adding receipt or updating stock: ", e);
+            setReceiptError("บันทึกรับเข้าสต็อกไม่สำเร็จ: " + e.message);
+        } finally {
+            setIsSaving(false);
+        }
+    };
+    
+    // Filtering Logic
+    const filteredReceipts = useMemo(() => {
+        if (selectedFilter === 'all') {
+            return receipts;
+        }
+        
+        // Filter by YYYY-MM (e.g., '2025-07')
+        return receipts.filter(receipt => {
+            const date = receipt.date; // already YYYY-MM-DD string
+            const filterYearMonth = selectedFilter; // e.g., '2025-07'
+            return date && date.substring(0, 7) === filterYearMonth;
+        });
+    }, [receipts, selectedFilter]);
+
+    // Get unique month/year options for filter dropdown
+    const filterOptions = useMemo(() => {
+        const options = new Set();
+        receipts.forEach(receipt => {
+            if (receipt.date) {
+                options.add(receipt.date.substring(0, 7)); // YYYY-MM
+            }
+        });
+        
+        const sortedOptions = Array.from(options).sort().reverse();
+        
+        return sortedOptions.map(ym => {
+            const [year, month] = ym.split('-');
+            const date = new Date(year, month - 1);
+            const formattedMonth = date.toLocaleDateString('th-TH', { month: 'long', year: 'numeric' });
+            return { value: ym, label: formattedMonth };
+        });
+    }, [receipts]);
+    
+    // NEW: Quantity Adjustment Helper
+    const adjustQuantity = (amount) => {
+        setNewReceipt(prev => {
+            const currentQty = parseInt(prev.quantity) || 0; // Use 0 if empty
+            const newQty = Math.max(0, currentQty + amount);
+            // Convert back to string for input value, but allow it to be empty string if 0, 
+            // but since we start at '', using 0 here is fine.
+            return { ...prev, quantity: newQty === 0 ? '' : newQty.toString() };
+        });
+    };
+
+
+    return (
+        <div className="space-y-6">
+            <section className="bg-white p-6 rounded-2xl shadow-xl border border-purple-100">
+                <h2 className="text-xl font-semibold text-purple-600 mb-4 flex items-center">
+                    <Truck className="mr-2" size={24} /> บันทึกรายการรับเข้าสต็อก (ซื้อสินค้า)
+                </h2>
+                
+                <form onSubmit={handleSaveReceipt} className="space-y-3">
+                    
+                    {/* Date and Product */}
+                    <div className="grid grid-cols-2 gap-3">
+                        <div>
+                            <label className="block text-xs font-medium text-gray-700 mb-1">วันที่รับเข้า</label>
+                            <input
+                                type="date"
+                                value={newReceipt.date}
+                                onChange={(e) => setNewReceipt({ ...newReceipt, date: e.target.value })}
+                                className="w-full p-3 border border-gray-300 rounded-xl focus:ring-purple-500 focus:border-purple-500"
+                                required
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-gray-700 mb-1">เลือกสินค้า</label>
+                            <select
+                                value={newReceipt.productId}
+                                onChange={(e) => setNewReceipt({ ...newReceipt, productId: e.target.value })}
+                                className="w-full p-3 border border-gray-300 rounded-xl focus:ring-purple-500 focus:border-purple-500 bg-white"
+                                required
+                            >
+                                <option value="" disabled>เลือกสินค้า...</option>
+                                {products.map(p => (
+                                    <option key={p.id} value={p.id}>{p.name}</option>
+                                ))}
+                            </select>
+                        </div>
+                    </div>
+
+                    {/* Quantity and Unit Cost */}
+                    <div className="grid grid-cols-2 gap-3">
+                        <div>
+                            <label className="block text-xs font-medium text-gray-700 mb-1">จำนวนที่รับเข้า</label>
+                            <div className="flex space-x-1">
+                                <input
+                                    type="number"
+                                    value={newReceipt.quantity}
+                                    onChange={(e) => setNewReceipt({ ...newReceipt, quantity: e.target.value })} // Allow any value including ''
+                                    placeholder="0"
+                                    min="0"
+                                    className="w-full p-3 border border-gray-300 rounded-xl focus:ring-purple-500 focus:border-purple-500"
+                                    required
+                                />
+                                {/* Quantity Buttons */}
+                                <button type="button" onClick={() => adjustQuantity(1)} className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 rounded-xl font-bold transition duration-150 text-sm w-12">+1</button>
+                                <button type="button" onClick={() => adjustQuantity(5)} className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 rounded-xl font-bold transition duration-150 text-sm w-12">+5</button>
+                                <button type="button" onClick={() => adjustQuantity(10)} className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 rounded-xl font-bold transition duration-150 text-sm w-12">+10</button>
+                            </div>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-gray-700 mb-1">ราคาต้นทุน/หน่วย</label>
+                            <input
+                                type="number"
+                                value={newReceipt.unitCost}
+                                onChange={(e) => setNewReceipt({ ...newReceipt, unitCost: e.target.value })}
+                                placeholder="ราคา/หน่วย"
+                                min="0.01"
+                                step="0.01"
+                                className="w-full p-3 border border-gray-300 rounded-xl focus:ring-purple-500 focus:border-purple-500"
+                                required
+                            />
+                        </div>
+                    </div>
+                    
+                    {/* NEW: Notes Field */}
+                    <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1">📝 หมายเหตุ (เช่น: สั่งจาก บจก. ปุ๋ยยักษ์, คืนของ)</label>
+                        <textarea
+                            value={newReceipt.notes}
+                            onChange={(e) => setNewReceipt({ ...newReceipt, notes: e.target.value })}
+                            placeholder="ระบุรายละเอียดเพิ่มเติม"
+                            rows="2"
+                            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-purple-500 focus:border-purple-500"
+                        />
+                    </div>
+
+                    {/* Summary and Button */}
+                    <div className="flex justify-between items-center bg-purple-50 p-3 rounded-xl border border-purple-200">
+                        <span className="font-bold text-lg text-purple-700">ราคารวมทั้งหมด:</span>
+                        <span className="font-extrabold text-2xl text-purple-700">{formatCurrency(totalCost)}</span>
+                    </div>
+
+                    <button
+                        type="submit"
+                        className="w-full px-6 py-3 bg-purple-500 text-white font-bold rounded-xl shadow-lg hover:bg-purple-600 transition duration-200 disabled:bg-purple-300 flex justify-center items-center"
+                        disabled={isSaving || !newReceipt.productId || (parseFloat(newReceipt.quantity) || 0) <= 0 || totalCost <= 0}
+                    >
+                        {isSaving ? (
+                            <>
+                                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
+                                กำลังบันทึกและเพิ่มสต็อก...
+                            </>
+                        ) : 'บันทึกรับเข้าสต็อก'}
+                    </button>
+                </form>
+                {receiptError && <p className="text-red-500 text-sm mt-2 text-center">{receiptError}</p>}
+                {products.length === 0 && (
+                     <p className="text-red-500 text-sm mt-2 text-center font-semibold">ต้องมีสินค้าในระบบอย่างน้อย 1 รายการก่อนจึงจะบันทึกรับเข้าได้! (ไปที่ 'รายการสินค้า' เพื่อเพิ่ม)</p>
+                )}
+            </section>
+
+            {/* 2. รายการรับเข้าที่บันทึกไว้แล้ว */}
+            <section className="bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden">
+                <h2 className="text-xl font-semibold text-gray-700 p-4 border-b bg-gray-50 flex items-center">
+                    <List className="mr-2" size={20} /> รายการรับเข้าสต็อก ({receipts.length} รายการ)
+                </h2>
+                
+                {/* Filter */}
+                <div className="p-4 border-b">
+                    <label htmlFor="monthFilter" className="text-sm font-medium text-gray-700 mr-2">เลือกดูรายเดือน:</label>
+                    <select
+                        id="monthFilter"
+                        value={selectedFilter}
+                        onChange={(e) => setSelectedFilter(e.target.value)}
+                        className="p-2 border border-gray-300 rounded-lg bg-white text-sm"
+                    >
+                        <option value="all">ทั้งหมด</option>
+                        {filterOptions.map(opt => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                    </select>
+                </div>
+
+                {receipts.length === 0 ? (
+                    <p className="p-6 text-center text-gray-500">ยังไม่มีรายการรับเข้าสต็อก</p>
+                ) : (
+                    <div className="divide-y divide-gray-100">
+                        {filteredReceipts.map((receipt) => {
+                            const receiptDate = receipt.date || (receipt.createdAt?.toDate ? receipt.createdAt.toDate().toLocaleDateString('th-TH') : 'ไม่ระบุวันที่');
+                            return (
+                                <div key={receipt.id} className="flex items-center justify-between p-4 bg-white border-b border-gray-100 last:border-b-0 text-sm hover:bg-purple-50">
+                                    <div className="flex-grow min-w-0">
+                                        <p className="font-semibold text-gray-800 truncate">{receipt.productName}</p>
+                                        <p className="text-gray-500 text-xs">
+                                            วันที่: {receiptDate} | จำนวน: {receipt.quantity} ชิ้น
+                                            {/* NEW: Display Notes */}
+                                            {receipt.notes && (
+                                                <span className="ml-2 px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full text-xs font-medium italic">
+                                                    หมายเหตุ: {receipt.notes}
+                                                </span>
+                                            )}
+                                        </p>
+                                        <p className="text-xs font-bold text-blue-600">
+                                            ต้นทุน/หน่วย: {formatCurrency(receipt.unitCost)}
+                                        </p>
+                                    </div>
+                                    
+                                    <div className="flex items-center space-x-2 flex-shrink-0">
+                                        <div className="text-right">
+                                            <span className="font-extrabold text-lg text-purple-700">{formatCurrency(receipt.totalCost)}</span>
+                                            <p className="text-xs text-gray-500">รวมต้นทุน</p>
+                                        </div>
+
+                                        <button
+                                            onClick={() => startDelete(receipt, 'ลบรายการรับเข้า', COLLECTION_PATHS.goodsReceipts)}
+                                            className="p-2 bg-red-500 text-white rounded-full shadow-md hover:bg-red-600 transition duration-150 transform hover:scale-105"
+                                            title="ลบรายการรับเข้า (ต้องใช้ PIN ยืนยัน)"
+                                        >
+                                            <Trash2 size={20} />
+                                        </button>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                        {selectedFilter !== 'all' && filteredReceipts.length === 0 && (
+                            <p className="p-6 text-center text-gray-500">ไม่พบรายการรับเข้าในเดือนที่เลือก</p>
+                        )}
+                    </div>
+                )}
+            </section>
+        </div>
+    );
+};
+
+// --- 8. Sale Details Modal ---
+
+const SaleDetailsModal = ({ isOpen, onClose, sale, products }) => {
+    if (!isOpen || !sale) return null;
+
+    const billDate = sale.createdAt?.toDate ? sale.createdAt.toDate().toLocaleDateString('th-TH', { 
+        year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' 
+    }) : 'ไม่พบข้อมูลวันที่';
+    
+    // Calculate totals from items list
+    const subtotal = sale.items.reduce((sum, item) => sum + (item.unitPrice * item.qty), 0);
+    const discount = sale.discount || 0;
+    const netAmount = sale.totalRevenue || (subtotal - discount);
+
+    
+    const handlePrint = () => {
+        const printContent = document.getElementById('bill-print-area');
+        if (printContent) {
+            const originalContents = document.body.innerHTML;
+            const printArea = printContent.innerHTML;
+
+            document.body.innerHTML = `
+                <style>
+                    @media print {
+                        body { margin: 0; padding: 0; font-family: 'Inter', sans-serif; font-size: 10pt; color: #000; }
+                        .print-container { width: 80mm; margin: 0 auto; padding: 10px; }
+                        .bill-header { text-align: center; font-size: 14pt; font-weight: bold; margin-bottom: 10px; }
+                        .bill-info, .bill-footer { border-top: 1px dashed #000; padding-top: 5px; margin-top: 5px; }
+                        .item-row { display: flex; justify-content: space-between; line-height: 1.5; }
+                    }
+                </style>
+                <div class="print-container">
+                    ${printArea}
+                </div>
+            `;
+            
+            window.print();
+            
+            setTimeout(() => {
+                document.body.innerHTML = originalContents;
+                window.location.reload(); 
+            }, 500);
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-xl p-6 w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto">
+                
+                {/* Printable Area Container */}
+                <div id="bill-print-area" className="p-4" style={{ minWidth: '300px' }}>
+                    <div className="text-center mb-4 border-b pb-2">
+                        <h3 className="text-2xl font-extrabold text-green-700">หลักเกษตร คุระบุรี 🌿</h3>
+                        <p className="text-sm text-gray-600">ใบเสร็จรับเงินอย่างย่อ</p>
+                    </div>
+
+                    <div className="text-sm text-gray-700 mb-4">
+                        <p><strong>บิลเลขที่:</strong> {sale.billId}</p>
+                        <p><strong>วันที่/เวลา:</strong> {billDate}</p>
+                        <p>--------------------------------------------------</p>
+                    </div>
+
+                    {/* Items Table */}
+                    <div className="space-y-1 text-sm">
+                        {sale.items.map((item, index) => (
+                            <div key={index} className="flex justify-between items-start item-row">
+                                <span className="w-1/2 pr-1 truncate">{item.name}</span>
+                                <div className="flex justify-between w-1/2 text-right">
+                                    <span className="w-1/3 text-center">{item.qty} x</span>
+                                    <span className="w-1/3 text-right">{item.unitPrice.toFixed(2)}</span>
+                                    <span className="w-1/3 text-right font-semibold">{(item.totalRevenue).toFixed(2)}</span>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    <div className="mt-4 border-t border-dashed border-gray-400 pt-3 space-y-2 text-sm">
+                        <div className="flex justify-between">
+                            <span>ยอดรวม (Subtotal):</span>
+                            <span className="font-semibold">{formatCurrency(subtotal)}</span>
+                        </div>
+                        <div className="flex justify-between text-red-600">
+                            <span>ส่วนลด:</span>
+                            <span className="font-semibold">{formatCurrency(discount)}</span>
+                        </div>
+                    </div>
+                    
+                    <div className="mt-4 border-t-2 border-green-700 pt-3 flex justify-between text-lg font-bold text-gray-800">
+                        <span>รวมทั้งสิ้น (Grand Total):</span>
+                        <span className="text-green-700">{formatCurrency(netAmount)}</span>
+                    </div>
+
+                    <div className="text-center mt-6 text-xs text-gray-500">
+                        <p>ขอบคุณที่อุดหนุนสินค้าเกษตรของเราค่ะ!</p>
+                    </div>
+                </div>
+                {/* End Printable Area */}
+
+                <div className="flex justify-between space-x-3 mt-6 border-t pt-4 print-hidden">
+                    <button
+                        onClick={handlePrint}
+                        className="flex-1 px-4 py-2 bg-blue-500 text-white rounded-lg font-semibold hover:bg-blue-600 transition duration-150 shadow-lg shadow-blue-200 flex items-center justify-center"
+                    >
+                        <Printer size={20} className="mr-2" /> พิมพ์บิล
+                    </button>
+                    <button
+                        onClick={onClose}
+                        className="flex-1 px-4 py-2 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300 transition duration-150"
+                    >
+                        ปิด
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- 9. Tab: Sales Manager (รายการออกบิลขาย) ---
+
+const SalesManager = ({ db, userId, sales, products, startDelete, updateProductStock, categories }) => {
+    
+    const [currentBillItems, setCurrentBillItems] = useState([]);
+    const [discount, setDiscount] = useState(0);
+    const [selectedProductId, setSelectedProductId] = useState('');
+    const [quantityInput, setQuantityInput] = useState(''); // FIX 2: Change initial quantityInput to ''
+    const [billError, setBillError] = useState(null);
+    const [isSaving, setIsSaving] = useState(false);
+
+    const [selectedSaleForView, setSelectedSaleForView] = useState(null);
+
+    const { subtotal, grandTotal, totalCostOfGoodsSold } = useMemo(() => {
+        const calculatedSubtotal = currentBillItems.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0);
+        
+        let calculatedGrandTotal = calculatedSubtotal - discount;
+        if (calculatedGrandTotal < 0) calculatedGrandTotal = 0;
+        
+        const calculatedTotalCostOfGoodsSold = currentBillItems.reduce((sum, item) => sum + (item.costPrice * item.quantity), 0);
+
+        return { 
+            subtotal: calculatedSubtotal, 
+            grandTotal: calculatedGrandTotal, 
+            totalCostOfGoodsSold: calculatedTotalCostOfGoodsSold 
+        };
+    }, [currentBillItems, discount]);
+
+    const handleAddItem = (e) => {
+        e.preventDefault();
+        setBillError(null);
+        
+        const productId = selectedProductId;
+        const qty = parseInt(quantityInput) || 0; // Use 0 if input is empty
+
+        if (!productId || qty <= 0) {
+            setBillError("กรุณาเลือกสินค้าและระบุจำนวนที่ถูกต้อง");
+            return;
+        }
+
+        const product = products.find(p => p.id === productId);
+        if (!product) return;
+        
+        // Stock check based on what is currently in the DB minus what's in the current cart
+        const currentInCartQty = currentBillItems.filter(item => item.id === productId).reduce((sum, item) => sum + item.quantity, 0);
+        
+        if (product.stockQuantity < (currentInCartQty + qty)) {
+            setBillError(`⚠️ สต็อกไม่พอ! สินค้า ${product.name} เหลือเพียง ${product.stockQuantity} ชิ้น`);
+            return;
+        }
+
+
+        const newItem = {
+            id: product.id,
+            name: product.name,
+            unitPrice: product.sellingPrice || 0,
+            costPrice: product.costPrice || 0, 
+            quantity: qty,
+            totalRevenue: (product.sellingPrice || 0) * qty
+        };
+
+        const existingIndex = currentBillItems.findIndex(item => item.id === newItem.id);
+
+        if (existingIndex > -1) {
+            const updatedItems = [...currentBillItems];
+            updatedItems[existingIndex].quantity += qty;
+            updatedItems[existingIndex].totalRevenue += newItem.totalRevenue;
+            setCurrentBillItems(updatedItems);
+        } else {
+            setCurrentBillItems([...currentBillItems, newItem]);
+        }
+        
+        setQuantityInput(''); // FIX: Reset input to '' after adding item
+        setSelectedProductId(''); // Reset selected product after adding item
+    };
+
+    const updateItemQuantity = (index, newQuantity) => {
+        const qty = parseInt(newQuantity) || 0;
+        
+        if (qty < 0) return;
+
+        // Check stock availability if reducing quantity
+        const item = currentBillItems[index];
+        const product = products.find(p => p.id === item.id);
+        
+        if (product.stockQuantity < qty) {
+            setBillError(`⚠️ สต็อกไม่พอสำหรับ ${product.name}! เหลือเพียง ${product.stockQuantity} ชิ้น`);
+            return;
+        }
+        
+        if (qty === 0) {
+            deleteItemFromBill(index);
+        } else {
+            const updatedItems = [...currentBillItems];
+            updatedItems[index].quantity = qty;
+            updatedItems[index].totalRevenue = item.unitPrice * qty;
+            setCurrentBillItems(updatedItems);
+        }
+    };
+    
+    // NEW: Quantity adjustment helper for the item in the bill
+    const adjustItemQuantity = (index, amount) => {
+        const item = currentBillItems[index];
+        const newQty = item.quantity + amount;
+        updateItemQuantity(index, newQty);
+    };
+
+
+    const deleteItemFromBill = (index) => {
+        setCurrentBillItems(currentBillItems.filter((_, i) => i !== index));
+        setBillError(null);
+    };
+    
+    // NEW: Helper for quantity buttons on the form input
+    const adjustFormQuantity = (amount) => {
+        setQuantityInput(prev => {
+            const currentQty = parseInt(prev) || 0; // Use 0 if input is empty
+            const newQty = Math.max(0, currentQty + amount); // Ensure new quantity >= 0
+            return newQty === 0 ? '' : newQty.toString();
+        });
+    };
+
+    const handleConfirmedSale = useCallback(async () => {
+        setIsSaving(true);
+        setBillError(null);
+
+        const finalItems = currentBillItems.map(item => ({
+            name: item.name,
+            unitPrice: item.unitPrice,
+            costPrice: item.costPrice,
+            qty: item.quantity,
+            totalRevenue: item.unitPrice * item.quantity,
+            totalCost: item.costPrice * item.quantity,
+        }));
+        
+        const billId = `B-${Math.floor(Date.now() / 1000) % 10000}`;
+
+        const saleDocument = {
+            billId: billId,
+            items: finalItems,
+            discount: discount,
+            subtotal: subtotal,
+            totalRevenue: grandTotal, 
+            totalCostOfGoodsSold: totalCostOfGoodsSold,
+            createdAt: serverTimestamp(),
+            // Add profit calculation to the bill record for reporting
+            profit: grandTotal - totalCostOfGoodsSold,
+        };
+
+        try {
+            const salesCollectionPath = `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.sales}`;
+            await addDoc(collection(db, salesCollectionPath), saleDocument);
+            
+            // Deduct stock for each item sold (using the pre-defined function)
+            const stockUpdatePromises = currentBillItems.map(item => 
+                updateProductStock(item.id, item.quantity)
+            );
+            await Promise.all(stockUpdatePromises);
+
+            // Reset form
+            setCurrentBillItems([]);
+            setDiscount(0);
+            setQuantityInput(''); // FIX: Reset quantity input to ''
+            setSelectedProductId(''); // Reset selected product after successful sale
+        } catch (e) {
+            console.error("Error adding sale or updating stock: ", e);
+            setBillError("บันทึกบิลขายไม่สำเร็จ: " + e.message);
+        } finally {
+            setIsSaving(false);
+        }
+    }, [db, userId, currentBillItems, discount, subtotal, grandTotal, totalCostOfGoodsSold, updateProductStock]); // Removed setters from dependencies
+
+    const handleSaveSale = async () => {
+        if (!db || !userId || currentBillItems.length === 0 || isSaving) {
+            setBillError("กรุณาเพิ่มรายการสินค้าในบิลก่อนบันทึก");
+            return;
+        }
+        
+        // No PIN confirmation needed for saving sale (as requested)
+        await handleConfirmedSale(); 
+    };
+    
+    // UI สำหรับแสดงรายการบิลที่บันทึกไว้แล้ว 
+    const SaleItem = ({ sale }) => {
+        const billDate = sale.createdAt?.toDate ? sale.createdAt.toDate().toLocaleDateString('th-TH') : 'กำลังโหลด...';
+        const profit = (sale.totalRevenue || 0) - (sale.totalCostOfGoodsSold || 0);
+
+        return (
+            <div className="flex items-center justify-between p-4 bg-white border-b border-gray-100 last:border-b-0 text-sm">
+                <div className="flex-grow min-w-0">
+                    <p className="font-semibold text-gray-800">บิลเลขที่: {sale.billId}</p>
+                    <p className="text-gray-500 text-xs">
+                        วันที่: {billDate} | กำไร: 
+                        <span className={`ml-1 font-bold ${profit >= 0 ? 'text-teal-600' : 'text-red-600'}`}>
+                            {formatCurrency(profit)}
+                        </span>
+                    </p>
+                </div>
+                
+                <div className="flex items-center space-x-2">
+                    <span className="font-extrabold text-lg text-green-700">{formatCurrency(sale.totalRevenue)}</span>
+                    
+                    {/* NEW: View/Print Button */}
+                    <button
+                        onClick={() => setSelectedSaleForView({ 
+                            ...sale,
+                            // Convert items structure for modal compatibility
+                            items: sale.items.map(i => ({
+                                name: i.name,
+                                qty: i.qty,
+                                unitPrice: i.unitPrice,
+                                totalRevenue: i.totalRevenue
+                            })) 
+                        })}
+                        className="p-2 bg-blue-500 text-white rounded-full shadow-md hover:bg-blue-600 transition duration-150 transform hover:scale-105"
+                        title="ดูรายละเอียด/พิมพ์บิล"
+                    >
+                        <Eye size={20} />
+                    </button>
+                    
+                    <button
+                        onClick={() => startDelete(sale, 'ลบบิลขาย', COLLECTION_PATHS.sales)}
+                        className="p-2 bg-red-500 text-white rounded-full shadow-md hover:bg-red-600 transition duration-150 transform hover:scale-105"
+                        title="ลบบิลขาย (ต้องใช้ PIN ยืนยัน)"
+                    >
+                        <Trash2 size={20} />
+                    </button>
+                </div>
+            </div>
+        );
+    };
+
+    return (
+        <div className="space-y-6">
+            
+            {/* Modal for viewing sale details */}
+            <SaleDetailsModal 
+                isOpen={!!selectedSaleForView}
+                onClose={() => setSelectedSaleForView(null)}
+                sale={selectedSaleForView}
+                products={products}
+            />
+
+            {/* 1. ส่วนสร้างบิลใหม่ (POS) */}
+            <section className="bg-white p-6 rounded-2xl shadow-xl border border-teal-100">
+                <h2 className="text-xl font-semibold text-teal-600 mb-4 flex items-center">
+                    <DollarSign className="mr-2" size={24} /> สร้างบิลขายใหม่
+                </h2>
+                
+                {/* 1A. Add Item Form (New Clean Layout) */}
+                <form onSubmit={handleAddItem} className="space-y-4 mb-4 border-b pb-4">
+                    {/* Row 1: Selection and Quantity Input with Buttons */}
+                    <div className="grid grid-cols-12 gap-3 items-center">
+                        {/* Product Select (col-span-12, sm:col-span-5) */}
+                        <div className="col-span-12 sm:col-span-5">
+                            <label htmlFor="productSelect" className="block text-xs font-medium text-gray-700 mb-1">เลือกสินค้า</label>
+                            <select
+                                id="productSelect"
+                                value={selectedProductId}
+                                onChange={(e) => setSelectedProductId(e.target.value)}
+                                className="w-full p-2 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 bg-white text-sm"
+                                required
+                            >
+                                <option value="" disabled>เลือกสินค้า...</option>
+                                {products.map(p => (
+                                    <option 
+                                        key={p.id} 
+                                        value={p.id}
+                                        disabled={p.stockQuantity <= 0}
+                                    >
+                                        {p.name} ({formatCurrency(p.sellingPrice || 0)}) {p.stockQuantity <= 0 ? ' (สินค้าหมด)' : ''}
+                                    </option>
+                                ))}
+                            </select>
+                            {/* Stock Alert Messages */}
+                            {selectedProductId && products.find(p => p.id === selectedProductId)?.stockQuantity <= 5 && products.find(p => p.id === selectedProductId)?.stockQuantity > 0 && (
+                                <p className="text-xs text-yellow-600 font-semibold mt-1 flex items-center"><AlertCircle size={12} className="mr-1" /> ใกล้หมด! เหลือ {products.find(p => p.id === selectedProductId)?.stockQuantity} ชิ้น</p>
+                            )}
+                            {selectedProductId && products.find(p => p.id === selectedProductId)?.stockQuantity <= 0 && (
+                                <p className="text-xs text-red-600 font-semibold mt-1 flex items-center"><AlertTriangle size={12} className="mr-1" /> สินค้าหมดแล้ว</p>
+                            )}
+                        </div>
+
+                        {/* Quantity Input with Quick Add Buttons (col-span-12, sm:col-span-7) */}
+                        <div className="col-span-12 sm:col-span-7">
+                            <label htmlFor="quantityInput" className="block text-xs font-medium text-gray-700 mb-1">จำนวน</label>
+                            {/* NEW LAYOUT: Input + Buttons Side-by-Side (Added flex layout here) */}
+                            <div className="flex items-center space-x-2"> 
+                                 <input
+                                    type="number"
+                                    id="quantityInput"
+                                    value={quantityInput}
+                                    onChange={(e) => setQuantityInput(e.target.value)} 
+                                    placeholder="0"
+                                    min="0"
+                                    className="w-20 p-2 border border-gray-300 rounded-xl focus:ring-teal-500 focus:border-teal-500 text-center text-sm" 
+                                    required
+                                />
+                                <div className="flex space-x-1">
+                                    <button type="button" onClick={() => adjustFormQuantity(1)} className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1 rounded-xl font-bold transition duration-150 text-sm w-12">+1</button>
+                                    <button type="button" onClick={() => adjustFormQuantity(5)} className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1 rounded-xl font-bold transition duration-150 text-sm w-12">+5</button>
+                                    <button type="button" onClick={() => adjustFormQuantity(10)} className="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1 rounded-xl font-bold transition duration-150 text-sm w-12">+10</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    {/* Row 2: Full-width Add Button (Moved the button out of the above grid and kept it full width) */}
+                    <div className="pt-2">
+                        <button
+                            type="submit"
+                            className="w-full py-2 bg-teal-500 text-white font-bold rounded-xl shadow-md hover:bg-teal-600 transition disabled:bg-teal-300 flex justify-center items-center"
+                            disabled={products.length === 0 || !selectedProductId || (parseInt(quantityInput) || 0) <= 0 || products.find(p => p.id === selectedProductId)?.stockQuantity < (parseInt(quantityInput) || 0)}
+                            title="เพิ่มสินค้าเข้าบิล"
+                        >
+                            <Plus size={20} className="inline mr-2" /> เพิ่มรายการเข้าบิล
+                        </button>
+                    </div>
+                </form>
+
+                {billError && <p className="text-red-500 text-sm mb-4 text-center">{billError}</p>}
+                
+                {/* 1B. ตารางรายการสินค้าในบิล */}
+                <div className="border border-gray-200 rounded-xl overflow-hidden mt-4">
+                    <div className="bg-gray-50 grid grid-cols-12 text-xs font-semibold text-gray-600 p-2 border-b">
+                        <span className="col-span-5">สินค้า</span>
+                        <span className="col-span-2 text-center">ราคา/หน่วย</span>
+                        <span className="col-span-2 text-center">จำนวน</span>
+                        <span className="col-span-2 text-right">รวม</span>
+                        <span className="col-span-1"></span>
+                    </div>
+                    <div className="divide-y divide-gray-100 min-h-[100px]">
+                        {currentBillItems.length === 0 ? (
+                            <p className="p-4 text-center text-gray-500 text-sm">ยังไม่มีรายการสินค้าในบิล</p>
+                        ) : (
+                            currentBillItems.map((item, index) => (
+                                <div key={index} className="grid grid-cols-12 items-center p-2 text-sm hover:bg-teal-50">
+                                    <span className="col-span-5 truncate pr-1 text-gray-700">{item.name}</span>
+                                    <span className="col-span-2 text-center text-gray-600">{item.unitPrice.toFixed(2)}</span>
+                                    <span className="col-span-2 text-center flex items-center justify-center space-x-1">
+                                         <button type="button" onClick={() => adjustItemQuantity(index, -1)} className="text-red-500 hover:text-red-700 p-1 rounded-full w-4 h-4 leading-none">-</button>
+                                         <span className='font-bold'>{item.quantity}</span>
+                                         <button type="button" onClick={() => adjustItemQuantity(index, 1)} className="text-green-500 hover:text-green-700 p-1 rounded-full w-4 h-4 leading-none">+</button>
+                                    </span>
+                                    <span className="col-span-2 text-right font-bold text-teal-700">{(item.unitPrice * item.quantity).toFixed(2)}</span>
+                                    <button 
+                                        onClick={() => deleteItemFromBill(index)} 
+                                        className="col-span-1 flex justify-center text-red-400 hover:text-red-600"
+                                        title="ลบรายการ"
+                                    >
+                                        <Trash2 size={16} />
+                                    </button>
+                                </div>
+                            ))
+                        )}
+                    </div>
+                </div>
+
+                {/* สรุปยอด */}
+                <div className="mt-6 space-y-2">
+                    <div className="flex justify-between items-center text-gray-700">
+                        <span className="font-medium">รวมราคาสินค้า (Subtotal):</span>
+                        <span className="font-semibold text-lg">{formatCurrency(subtotal)}</span>
+                    </div>
+
+                    <div className="flex justify-between items-center pt-2 border-t border-gray-100">
+                        <label htmlFor="discountInput" className="font-medium text-gray-700">ส่วนลดท้ายบิล (บาท):</label>
+                        <input 
+                            type="number" 
+                            id="discountInput" 
+                            value={discount.toFixed(2)} 
+                            onChange={(e) => setDiscount(Math.max(0, parseFloat(e.target.value) || 0))} 
+                            min="0" 
+                            className="w-32 text-right p-1 border rounded-lg text-red-600 font-semibold" 
+                            step="0.01"
+                        />
+                    </div>
+                    
+                    <div className="pt-4 border-t-2 border-teal-500 flex justify-between items-center text-xl text-gray-800">
+                        <span className="font-bold text-teal-700">รวมทั้งสิ้น (Grand Total):</span>
+                        <span className="font-extrabold text-2xl text-teal-700">{formatCurrency(grandTotal)}</span>
+                    </div>
+                </div>
+
+                <button
+                    onClick={handleSaveSale} 
+                    className="w-full mt-6 px-6 py-3 bg-teal-600 text-white font-bold rounded-xl shadow-lg hover:bg-teal-700 transition duration-200 disabled:bg-teal-300 flex justify-center items-center"
+                    disabled={currentBillItems.length === 0 || isSaving}
+                >
+                    {isSaving ? (
+                        <>
+                            <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>
+                            กำลังบันทึกบิลและตัดสต็อก...
+                        </>
+                    ) : 'บันทึกบิลขาย'}
+                </button>
+
+            </section>
+
+            {/* 2. รายการบิลที่บันทึกไว้แล้ว */}
+            <section className="bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden">
+                <h2 className="text-xl font-semibold text-gray-700 p-4 border-b bg-gray-50 flex items-center">
+                    <List className="mr-2" size={20} /> รายการบิลขายที่บันทึกแล้ว ({sales.length} บิล)
+                </h2>
+                {sales.length === 0 ? (
+                    <p className="p-6 text-center text-gray-500">ยังไม่มีรายการบิลขาย</p>
+                ) : (
+                    <div className="divide-y divide-gray-100">
+                        {sales.map((sale) => (
+                            <SaleItem key={sale.id} sale={sale} />
+                        ))}
+                    </div>
+                )}
+            </section>
+        </div>
+    );
+};
+
+// --- 10. Main App Component (Updated) ---
+
+export default function App() {
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null); // NEW: State for Auth instance
+    const [userId, setUserId] = useState(null);
+    const [activeTab, setActiveTab] = useState(TAB_OPTIONS.DASHBOARD);
+    
+    // Data States
+    const [categories, setCategories] = useState([]); 
+    const [products, setProducts] = useState([]); 
+    const [sales, setSales] = useState([]); 
+    const [receipts, setReceipts] = useState([]); 
+    const [adminPin, setAdminPin] = useState(null);
+
+    // App Status
+    const [isLoading, setIsLoading] = useState(true);
+    const [isAuthChecking, setIsAuthChecking] = useState(true); // NEW: Check if initial auth check is done
+    const [error, setError] = useState(null);
+    
+    // Delete Modal States
+    const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+    const [itemToDelete, setItemToDelete] = useState(null); 
+    const [deleteActionName, setDeleteActionName] = useState('');
+    const [deleteCollectionPath, setDeleteCollectionPath] = useState('');
+    const [onConfirmCallback, setOnConfirmCallback] = useState(null); 
+
+    // --- Firebase Initialization & Authentication ---
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+            
+            setDb(firestore);
+            setAuth(firebaseAuth); // Store auth instance
+            setIsLoading(false);
+
+            const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                    // User signed in (via token, anonymous, or email/password)
+                    setUserId(user.uid);
+                    setIsAuthChecking(false);
+                } else {
+                    // No user signed in yet, attempt silent sign-in
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined') {
+                            await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(firebaseAuth);
+                        }
+                    } catch (e) {
+                        console.error("Silent Auth Error (Will show login):", e);
+                        // If silent auth fails, we stop loading and let the UI show AuthManager
+                        setIsAuthChecking(false);
+                    }
+                }
+            });
+
+            return () => unsubscribeAuth();
+        } catch (e) {
+            console.error("Firebase Initialization Error:", e);
+            setError("ไม่สามารถเริ่มต้น Firebase ได้");
+            setIsLoading(false);
+            setIsAuthChecking(false);
+        }
+    }, []);
+
+    // --- Real-time Data Listeners ---
+    useEffect(() => {
+        if (!db || !userId) return;
+
+        let unsubscribes = [];
+        const baseDocPath = `/artifacts/${appId}/users/${userId}`;
+
+        // Helper to setup listener
+        const setupListener = (collectionName, setState) => {
+            const q = collection(db, `${baseDocPath}/${collectionName}`);
+            return onSnapshot(q, (snapshot) => {
+                const fetchedData = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                })).sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)); // Sort DESC by timestamp
+                setState(fetchedData);
+                setIsLoading(false);
+            }, (err) => {
+                console.error(`Firestore ${collectionName} Snapshot Error:`, err);
+                setError(`เกิดข้อผิดพลาดในการดึงข้อมูล ${collectionName}`);
+                setIsLoading(false);
+            });
+        };
+
+        // A. Categories Listener
+        unsubscribes.push(setupListener(COLLECTION_PATHS.categories, setCategories));
+        
+        // B. Products Listener (Sort by name, status handled in render)
+        const productsQuery = query(collection(db, `${baseDocPath}/${COLLECTION_PATHS.products}`)); // No orderBy here to avoid index errors
+        unsubscribes.push(onSnapshot(productsQuery, (snapshot) => {
+            const fetchedData = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            setProducts(fetchedData);
+            setIsLoading(false);
+        }, (err) => {
+            console.error(`Firestore Products Snapshot Error:`, err);
+            setError(`เกิดข้อผิดพลาดในการดึงข้อมูลสินค้า`);
+            setIsLoading(false);
+        }));
+
+        // C. Sales Listener
+        unsubscribes.push(setupListener(COLLECTION_PATHS.sales, setSales));
+        
+        // D. Goods Receipts Listener 
+        unsubscribes.push(setupListener(COLLECTION_PATHS.goodsReceipts, setReceipts));
+
+        // E. Admin PIN Listener
+        const pinDocRef = doc(db, `${baseDocPath}/${CONFIG_DOC_PATH}`);
+        const unsubscribePin = onSnapshot(pinDocRef, (docSnap) => {
+            if (docSnap.exists() && docSnap.data().pin) {
+                setAdminPin(docSnap.data().pin);
+            } else {
+                // Default to a known PIN if not set, but ensure UI encourages proper setup
+                setAdminPin('4321'); 
+            }
+        }, (err) => {
+            console.error("Firestore PIN Snapshot Error:", err);
+        });
+        unsubscribes.push(unsubscribePin);
+
+        return () => unsubscribes.forEach(unsub => unsub());
+    }, [db, userId]);
+
+    // --- Stock Update Functions ---
+
+    // 1. Deduct Stock (for Sales)
+    const updateProductStock = useCallback(async (productId, soldQuantity) => {
+        if (!db || !userId) {
+            console.error("Database or User ID is missing for stock update.");
+            return;
+        }
+
+        try {
+            const productRef = doc(db, `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.products}`, productId);
+            
+            // Use transaction to ensure safe read and write for stock
+            await runTransaction(db, async (transaction) => {
+                const productDoc = await transaction.get(productRef);
+                if (!productDoc.exists()) {
+                    throw new Error("Product not found");
+                }
+                
+                const currentStock = productDoc.data().stockQuantity || 0;
+                const newStock = Math.max(0, currentStock - soldQuantity); 
+                
+                transaction.update(productRef, { 
+                    stockQuantity: newStock,
+                    updatedAt: serverTimestamp()
+                });
+            });
+            
+        } catch (e) {
+            console.error("Error updating product stock: ", e);
+        }
+    }, [db, userId]);
+    
+    // 2. Add Stock (for Goods Receipt)
+    const receiveProductStock = useCallback(async (productId, receivedQuantity, unitCost) => {
+        if (!db || !userId) {
+            console.error("Database or User ID is missing for stock receipt.");
+            return;
+        }
+
+        try {
+            const productRef = doc(db, `/artifacts/${appId}/users/${userId}/${COLLECTION_PATHS.products}`, productId);
+            
+            // Use transaction to ensure safe read and write for stock and cost
+            await runTransaction(db, async (transaction) => {
+                const productDoc = await transaction.get(productRef);
+                if (!productDoc.exists()) {
+                    throw new Error("Product not found");
+                }
+                
+                const currentStock = productDoc.data().stockQuantity || 0;
+                const newStock = currentStock + receivedQuantity;
+                
+                // Update product: new stock AND new cost price
+                transaction.update(productRef, { 
+                    stockQuantity: newStock,
+                    costPrice: unitCost, 
+                    updatedAt: serverTimestamp()
+                });
+            });
+
+        } catch (e) {
+            console.error("Error receiving product stock: ", e);
+        }
+    }, [db, userId]);
+    
+    // --- Data Reset Function ---
+    const resetAllData = useCallback(async () => {
+        if (!db || !userId) return;
+        
+        try {
+            const collectionsToReset = [
+                COLLECTION_PATHS.products,
+                COLLECTION_PATHS.sales,
+                COLLECTION_PATHS.goodsReceipts,
+                COLLECTION_PATHS.categories,
+            ];
+
+            const baseDocPath = `/artifacts/${appId}/users/${userId}`;
+            
+            // Delete documents in batches (Firestore limitation)
+            for (const collectionName of collectionsToReset) {
+                const q = collection(db, `${baseDocPath}/${collectionName}`);
+                const snapshot = await getDocs(q); // Fetch all documents
+                
+                const deletePromises = [];
+                snapshot.docs.forEach(doc => {
+                    deletePromises.push(deleteDoc(doc.ref));
+                });
+                
+                await Promise.all(deletePromises);
+                console.log(`Successfully reset collection: ${collectionName}`);
+            }
+
+            // Reset PIN as well
+            const pinDocRef = doc(db, `${baseDocPath}/${CONFIG_DOC_PATH}`);
+            await deleteDoc(pinDocRef);
+            
+            setError(null);
+            alert("ล้างข้อมูลทั้งหมดสำเร็จแล้วค่ะ! ระบบจะเริ่มต้นใหม่นะคะ.");
+            window.location.reload(); // Force refresh to clear all states
+
+        } catch (e) {
+            console.error("Error resetting all data: ", e);
+            setError("เกิดข้อผิดพลาดร้ายแรงในการล้างข้อมูล");
+        }
+    }, [db, userId, products, sales, receipts, categories]); 
+
+
+    // --- Delete Functionality ---
+
+    const startDelete = useCallback((item, actionName, collectionPath, callback = null) => {
+        if (!adminPin) {
+             setError('คุณต้องตั้งค่ารหัส PIN ก่อนจึงจะลบข้อมูลที่สำคัญได้! กรุณาไปที่แท็บ "ตั้งค่า Admin"');
+             return;
+        }
+        setItemToDelete(item);
+        setDeleteActionName(actionName);
+        setDeleteCollectionPath(collectionPath);
+        // FIX: Store the callback directly, not wrapped in a function
+        setOnConfirmCallback(callback); 
+        setIsDeleteModalOpen(true);
+    }, [adminPin, setError, setItemToDelete, setDeleteActionName, setDeleteCollectionPath, setOnConfirmCallback, setIsDeleteModalOpen]); // Add all setters to dependency array
+
+    // NEW: Start Reset function
+    const startResetAllData = useCallback(() => {
+        if (!adminPin) {
+             setError('คุณต้องตั้งค่ารหัส PIN ก่อนจึงจะล้างข้อมูลที่สำคัญได้! กรุณาไปที่แท็บ "ตั้งค่า Admin"');
+             return;
+        }
+        // Use a special collectionPath to signal a full reset
+        startDelete({ name: 'ข้อมูลทั้งหมด' }, 'ล้างข้อมูลทั้งหมด', 'FULL_DATA_RESET', resetAllData);
+    }, [adminPin, resetAllData, startDelete]);
+
+
+    const confirmDelete = useCallback(async () => {
+        if (!itemToDelete || !db || !userId || !deleteCollectionPath) return;
+
+        // 1. Full Data Reset Check
+        if (deleteCollectionPath === 'FULL_DATA_RESET' && onConfirmCallback) {
+            await onConfirmCallback();
+            
+            setIsDeleteModalOpen(false);
+            setItemToDelete(null);
+            setOnConfirmCallback(null);
+            return; // EXIT after reset
+        }
+
+        // 2. Standard Delete (Requires item ID)
+        if (!itemToDelete.id) { 
+             console.error("Item to delete has no ID for standard delete path.", itemToDelete);
+             setError(`ไม่สามารถลบรายการได้: ข้อมูลรายการไม่สมบูรณ์`);
+             setIsDeleteModalOpen(false);
+             setItemToDelete(null);
+             setOnConfirmCallback(null);
+             return;
+        }
+        
+        try {
+            const itemDocRef = doc(db, `/artifacts/${appId}/users/${userId}/${deleteCollectionPath}`, itemToDelete.id);
+            await deleteDoc(itemDocRef);
+            
+            // Special handling for Goods Receipts to reverse stock (simplification: only deletes the receipt log)
+            if (deleteCollectionPath === COLLECTION_PATHS.goodsReceipts) {
+                 // In a real app, this should trigger a stock reversal transaction using the itemToDelete data.
+                 // For now, we only delete the log entry.
+                 console.warn("Goods Receipt deleted: Stock reversal logic should be implemented here.");
+            }
+            
+            setIsDeleteModalOpen(false);
+            setItemToDelete(null);
+            setOnConfirmCallback(null);
+            setError(null); 
+        } catch (e) {
+            console.error("Error deleting document: ", e);
+            setError(`ลบ ${deleteActionName} ไม่สำเร็จ`);
+        }
+    }, [itemToDelete, db, userId, deleteCollectionPath, onConfirmCallback, deleteActionName]); // Add all dependencies
+
+    // --- Render Logic ---
+
+    // NEW: Handle Logout
+    const handleLogout = () => {
+        if (auth) {
+            signOut(auth).then(() => {
+                setUserId(null);
+                setActiveTab(TAB_OPTIONS.DASHBOARD);
+                setError(null);
+                setIsAuthChecking(false); // Make sure the auth manager appears immediately
+            }).catch(e => {
+                console.error("Logout error:", e);
+                setError("เกิดข้อผิดพลาดในการออกจากระบบ");
+            });
+        }
+    };
+
+    const renderContent = () => {
+        switch (activeTab) {
+            case TAB_OPTIONS.DASHBOARD:
+                return <DashboardManager products={products} sales={sales} />;
+            case TAB_OPTIONS.CATEGORY:
+                return <CategoryManager db={db} userId={userId} categories={categories} startDelete={startDelete} />;
+            case TAB_OPTIONS.PRODUCT:
+                return <ProductManager 
+                            db={db} 
+                            userId={userId} 
+                            products={products} 
+                            categories={categories} 
+                            startDelete={startDelete} 
+                        />;
+            case TAB_OPTIONS.GOODS_RECEIPT: 
+                 return <GoodsReceiptManager 
+                            db={db} 
+                            userId={userId} 
+                            products={products}
+                            receipts={receipts}
+                            startDelete={startDelete}
+                            receiveProductStock={receiveProductStock}
+                        />;
+            case TAB_OPTIONS.SALE:
+                return <SalesManager 
+                            db={db} 
+                            userId={userId} 
+                            sales={sales} 
+                            products={products} 
+                            startDelete={startDelete} 
+                            updateProductStock={updateProductStock}
+                        />;
+            case TAB_OPTIONS.ADMIN:
+                return <AdminPinManager 
+                            db={db} 
+                            userId={userId} 
+                            currentPin={adminPin} 
+                            onPinUpdate={setAdminPin} 
+                            sales={sales} 
+                            startResetAllData={startResetAllData} // NEW: Pass the reset function
+                        />;
+            default:
+                return <div>เลือกแท็บเพื่อเริ่มต้นการทำงาน</div>;
+        }
+    };
+
+    // --- AuthManager Component (NEW) ---
+    const AuthManager = () => {
+        const [email, setEmail] = useState('');
+        const [password, setPassword] = useState('');
+        const [isRegisterMode, setIsRegisterMode] = useState(false);
+        const [authMessage, setAuthMessage] = useState('');
+        const [isProcessing, setIsProcessing] = useState(false);
+
+        const handleAuthAction = async (e) => {
+            e.preventDefault();
+            setAuthMessage('');
+            setIsProcessing(true);
+
+            if (!email || password.length < 6) {
+                setAuthMessage('รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร และกรุณากรอกอีเมลให้ถูกต้อง');
+                setIsProcessing(false);
+                return;
+            }
+
+            try {
+                if (isRegisterMode) {
+                    await createUserWithEmailAndPassword(auth, email, password);
+                    setAuthMessage('🎉 ลงทะเบียนสำเร็จแล้ว! กำลังเข้าสู่ระบบ...');
+                } else {
+                    await signInWithEmailAndPassword(auth, email, password);
+                    setAuthMessage('✅ เข้าสู่ระบบสำเร็จ! กำลังโหลดแดชบอร์ด...');
+                }
+            } catch (e) {
+                console.error("Auth error:", e);
+                let msg = e.message;
+                if (e.code === 'auth/email-already-in-use') msg = 'อีเมลนี้ถูกใช้แล้ว ลองเข้าสู่ระบบแทน';
+                if (e.code === 'auth/user-not-found' || e.code === 'auth/wrong-password') msg = 'อีเมลหรือรหัสผ่านไม่ถูกต้อง';
+                
+                setAuthMessage(`❌ ข้อผิดพลาด: ${msg}`);
+            } finally {
+                setIsProcessing(false);
+            }
+        };
+
+        return (
+            <div className="max-w-md mx-auto p-6 bg-white rounded-xl shadow-2xl border-t-4 border-blue-500">
+                <h2 className="text-2xl font-bold text-gray-800 mb-6 flex items-center justify-center">
+                    {isRegisterMode ? <UserPlus size={24} className="mr-2 text-green-600" /> : <User size={24} className="mr-2 text-blue-600" />}
+                    {isRegisterMode ? 'ลงทะเบียนบัญชีใหม่' : 'เข้าสู่ระบบ (Admin)'}
+                </h2>
+                <p className="text-sm text-gray-500 mb-4 text-center">
+                    เพื่อเข้าถึงข้อมูลร้านหลักเกษตร คุระบุรี
+                </p>
+
+                <form onSubmit={handleAuthAction} className="space-y-4">
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700">อีเมล</label>
+                        <input
+                            type="email"
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500"
+                            placeholder="your.email@example.com"
+                            required
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700">รหัสผ่าน</label>
+                        <input
+                            type="password"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500"
+                            placeholder="อย่างน้อย 6 ตัวอักษร"
+                            minLength="6"
+                            required
+                        />
+                    </div>
+                    
+                    {authMessage && (
+                        <p className={`p-3 rounded-lg text-sm font-semibold text-center ${authMessage.includes('❌') ? 'bg-red-100 text-red-600' : 'bg-green-100 text-green-600'}`}>
+                            {authMessage}
+                        </p>
+                    )}
+
+                    <button
+                        type="submit"
+                        className="w-full py-3 text-white font-bold rounded-xl shadow-lg transition duration-200 flex justify-center items-center"
+                        disabled={isProcessing || password.length < 6}
+                        style={{ backgroundColor: isRegisterMode ? '#10b981' : '#3b82f6' }}
+                    >
+                        {isProcessing ? <LoadingSpinner /> : (isRegisterMode ? 'ลงทะเบียน' : 'เข้าสู่ระบบ')}
+                    </button>
+                </form>
+
+                <button
+                    onClick={() => setIsRegisterMode(!isRegisterMode)}
+                    className="w-full mt-4 text-sm text-gray-600 hover:text-blue-600 transition"
+                >
+                    {isRegisterMode ? 'มีบัญชีอยู่แล้ว? เข้าสู่ระบบ' : 'ยังไม่มีบัญชี? ลงทะเบียนใหม่'}
+                </button>
+            </div>
+        );
+    };
+
+
+    if (error && !isAuthChecking) {
+        return (
+            <div className="p-6 text-center text-red-600 bg-red-100 rounded-xl m-4 shadow-lg border border-red-300 max-w-xl mx-auto">
+                <h2 className="font-bold text-xl mb-2">ข้อความแจ้งเตือน!</h2>
+                <p>{error}</p>
+                <button
+                    onClick={() => setError(null)}
+                    className="mt-3 px-4 py-2 bg-red-500 text-white rounded-lg font-semibold hover:bg-red-600 transition duration-150"
+                >
+                    ตกลง
+                </button>
+            </div>
+        );
+    }
+    
+    // 1. Show Loading while checking initial auth status
+    if (isLoading || isAuthChecking) {
+        return <LoadingSpinner />;
+    }
+    
+    // 2. Show Auth Manager if not logged in
+    if (!userId && !isAuthChecking) {
+        return (
+            <div className="min-h-screen bg-gray-50 p-4 sm:p-8 font-sans flex items-center justify-center">
+                {auth && <AuthManager />}
+            </div>
+        );
+    }
+
+    // 3. Show Main App
+    return (
+        <div className="min-h-screen bg-gray-50 p-4 sm:p-8 font-sans">
+            
+            {/* Modal ยืนยันการลบ */}
+            <DeleteConfirmationModal
+                isOpen={isDeleteModalOpen}
+                onClose={() => setIsDeleteModalOpen(false)}
+                onConfirm={confirmDelete}
+                itemName={itemToDelete?.name || itemToDelete?.billId || 'รายการนี้'}
+                deleteAction={deleteActionName}
+                correctPin={adminPin}
+            />
+
+            {/* Header */}
+            <header className="text-center mb-6">
+                <h1 className="text-3xl font-extrabold text-green-700 sm:text-4xl tracking-tight">
+                    หลักเกษตร คุระบุรี 🌿
+                </h1>
+                <p className="mt-2 text-md text-gray-500 flex justify-center items-center">
+                    แดชบอร์ดสรุปกำไรขาดทุนและแจ้งเตือนสต็อกอัตโนมัติ!
+                    {auth && (
+                        <button 
+                            onClick={handleLogout}
+                            className="ml-4 px-3 py-1 bg-red-100 text-red-600 rounded-full text-xs font-semibold hover:bg-red-200 transition flex items-center"
+                            title="ออกจากระบบ"
+                        >
+                            <LogOut size={14} className="mr-1" /> Logout
+                        </button>
+                    )}
+                </p>
+                <div className="mt-4 text-xs text-gray-400 p-2 bg-green-50 rounded-lg">
+                    App ID: {appId} | User ID: {userId}
+                </div>
+            </header>
+
+            <main className="max-w-xl mx-auto">
+                {/* Tab Navigation */}
+                {/* START FIX: Removed overflow-x-auto and ensured buttons are flex-1 */}
+                <div className="flex bg-white p-2 rounded-2xl shadow-lg mb-6 border border-gray-100 flex-nowrap">
+                    {[{ id: TAB_OPTIONS.DASHBOARD, icon: Home, label: 'แดชบอร์ด' },
+                      { id: TAB_OPTIONS.PRODUCT, icon: Package, label: 'รายการสินค้า' },
+                      { id: TAB_OPTIONS.GOODS_RECEIPT, icon: Truck, label: 'รับเข้าสต็อก' }, 
+                      { id: TAB_OPTIONS.SALE, icon: DollarSign, label: 'บิลขาย' },
+                      { id: TAB_OPTIONS.CATEGORY, icon: List, label: 'หมวดหมู่' },
+                      { id: TAB_OPTIONS.ADMIN, icon: Settings, label: 'ตั้งค่า Admin' },
+                    ].map(tab => {
+                        const Icon = tab.icon;
+                        return (
+                        <button
+                            key={tab.id}
+                            onClick={() => setActiveTab(tab.id)}
+                            className={`flex-1 flex flex-col items-center p-2 rounded-xl transition duration-150 text-xs font-semibold whitespace-nowrap ${ // Changed text-sm to text-xs and removed min-w
+                                activeTab === tab.id
+                                    ? 'bg-green-500 text-white shadow-md'
+                                    : 'text-gray-600 hover:bg-gray-100'
+                            }`}
+                        >
+                            <Icon size={18} className="mb-0.5" />
+                            {tab.label}
+                        </button>
+                    )})}
+                </div>
+                {/* END FIX */}
+
+                {/* Content Area */}
+                {renderContent()}
+            </main>
+            
+            {/* Footer */}
+            <footer className="mt-8 text-center text-gray-400 text-sm">
+                <p>ข้อมูลทั้งหมดถูกจัดเก็บแบบส่วนตัวด้วย Firestore</p>
+            </footer>
+        </div>
+    );
+}
